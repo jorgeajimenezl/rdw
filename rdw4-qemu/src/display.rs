@@ -68,6 +68,8 @@ mod imp {
         cursor_hide: RefCell<Option<glib::SourceId>>,
         // the guest cursor is hidden (as last told to rdw)
         cursor_hidden: Cell<bool>,
+        // the last cursor event was a CursorDefine
+        after_define: Cell<bool>,
     }
 
     #[glib::object_subclass]
@@ -276,7 +278,7 @@ mod imp {
                             move || {
                                 // Fired: forget the id (removing it now would fail).
                                 this.cursor_hide.take();
-                                log::debug!("guest cursor parked at the origin");
+                                log::debug!("guest cursor left at the origin after a shape update");
                                 this.set_cursor_visible(false);
                             }
                         ),
@@ -457,6 +459,7 @@ mod imp {
                                         );
                                         this.obj().define_cursor(Some(cursor));
                                         this.cursor_hot.set((c.hot_x, c.hot_y));
+                                        this.after_define.set(true);
                                     }
                                     MouseSet(m) => {
                                         log::trace!("{m:?}");
@@ -470,6 +473,7 @@ mod imp {
                                             m.x,
                                             m.y,
                                             m.on != 0,
+                                            this.after_define.replace(false),
                                             this.host_pos.get(),
                                             this.cursor_hot.get(),
                                         ));
