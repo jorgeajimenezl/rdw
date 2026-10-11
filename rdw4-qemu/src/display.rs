@@ -66,6 +66,8 @@ mod imp {
         cursor_hot: Cell<(i32, i32)>,
         // pending hide of a cursor parked at the origin (see cursor.rs)
         cursor_hide: RefCell<Option<glib::SourceId>>,
+        // the guest cursor is hidden (as last told to rdw)
+        cursor_hidden: Cell<bool>,
     }
 
     #[glib::object_subclass]
@@ -246,6 +248,13 @@ mod imp {
     }
 
     impl Display {
+        fn set_cursor_visible(&self, visible: bool) {
+            if self.cursor_hidden.replace(!visible) == visible {
+                log::debug!("guest cursor {}", if visible { "shown" } else { "hidden" });
+            }
+            self.obj().set_cursor_visible(visible);
+        }
+
         fn update_cursor_visibility(&self, v: cursor::Visibility) {
             use cursor::Visibility::*;
             match v {
@@ -253,7 +262,7 @@ mod imp {
                     if let Some(id) = self.cursor_hide.take() {
                         id.remove();
                     }
-                    self.obj().set_cursor_visible(v == Show);
+                    self.set_cursor_visible(v == Show);
                 }
                 HideSoon => {
                     if self.cursor_hide.borrow().is_some() {
@@ -267,8 +276,8 @@ mod imp {
                             move || {
                                 // Fired: forget the id (removing it now would fail).
                                 this.cursor_hide.take();
-                                log::debug!("guest cursor parked at the origin: hidden");
-                                this.obj().set_cursor_visible(false);
+                                log::debug!("guest cursor parked at the origin");
+                                this.set_cursor_visible(false);
                             }
                         ),
                     );
