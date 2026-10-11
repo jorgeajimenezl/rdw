@@ -167,6 +167,17 @@ pub extern "C" fn rdw_display_set_cursor_position(
     this.set_cursor_position(pos);
 }
 
+/// rdw_display_set_cursor_visible:
+/// @dpy: A #RdwDisplay
+/// @visible: whether the remote shows its cursor
+///
+/// Hide or show the remote cursor (in mouse absolute mode, a hidden cursor shows no pointer).
+#[no_mangle]
+pub extern "C" fn rdw_display_set_cursor_visible(dpy: *mut RdwDisplay, visible: bool) {
+    let this: &Display = unsafe { &from_glib_borrow(dpy) };
+    this.set_cursor_visible(visible);
+}
+
 /// rdw_display_update_area:
 /// @dpy: A #RdwDisplay
 /// @data: (array) (element-type guint8): data

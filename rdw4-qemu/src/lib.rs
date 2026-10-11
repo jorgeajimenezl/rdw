@@ -2,6 +2,7 @@
 pub mod audio;
 /// cbindgen:ignore
 pub mod clipboard;
+mod cursor;
 mod display;
 /// cbindgen:ignore
 #[cfg(unix)]

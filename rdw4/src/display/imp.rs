@@ -39,6 +39,8 @@ pub struct Display {
     pub(crate) mouse_absolute: Cell<bool>,
     // position of cursor when drawn by client
     pub(crate) cursor_position: Cell<Option<(i32, i32)>>,
+    // the remote hid its cursor (absolute mode: show none instead of the defined shape)
+    pub(crate) cursor_hidden: Cell<bool>,
     // press-and-release detection time in ms
     pub(crate) synthesize_delay: Cell<u32>,
     pub(crate) last_key_press: Cell<Option<(gdk::Key, u32)>>,
@@ -552,7 +554,12 @@ impl Display {
         if self.read_only() || self.show_local_cursor() {
             self.picture.set_cursor(None);
         } else if self.mouse_absolute() {
-            self.picture.set_cursor(self.cursor.borrow().as_ref());
+            let cursor = self.cursor.borrow();
+            if self.cursor_hidden.get() && cursor.is_some() {
+                self.picture.set_cursor_from_name(Some("none"));
+            } else {
+                self.picture.set_cursor(cursor.as_ref());
+            }
         } else if self.grabbed.get().contains(Grab::MOUSE) {
             self.picture.set_cursor_from_name(Some("none"));
         } else {

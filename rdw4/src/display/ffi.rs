@@ -26,6 +26,8 @@ extern "C" {
 
     pub fn rdw_display_set_cursor_position(dpy: *mut RdwDisplay, enabled: bool, x: i32, y: i32);
 
+    pub fn rdw_display_set_cursor_visible(dpy: *mut RdwDisplay, visible: bool);
+
     pub fn rdw_display_update_area(
         dpy: *mut RdwDisplay,
         x: i32,

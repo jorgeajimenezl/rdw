@@ -1,4 +1,4 @@
-use crate::{audio, clipboard};
+use crate::{audio, clipboard, cursor};
 use futures_util::StreamExt;
 use glib::{clone, subclass::prelude::*, MainContext};
 use gtk::glib;
@@ -60,6 +60,12 @@ mod imp {
         pub(crate) audio_handler: RefCell<Option<audio::Handler>>,
         #[allow(unused)] // only here to keep it alive
         pub(crate) clipboard_handler: RefCell<Option<clipboard::Handler>>,
+        // last absolute position sent to the guest
+        host_pos: Cell<Option<(i32, i32)>>,
+        // hot spot of the guest's current cursor
+        cursor_hot: Cell<(i32, i32)>,
+        // pending hide of a cursor parked at the origin (see cursor.rs)
+        cursor_hide: RefCell<Option<glib::SourceId>>,
     }
 
     #[glib::object_subclass]
@@ -109,6 +115,7 @@ mod imp {
                 self,
                 move |_, x, y| {
                     log::trace!("motion: {:?}", (x, y));
+                    this.host_pos.set(Some((x as _, y as _)));
                     MainContext::default().spawn_local(clone!(
                         #[weak]
                         this,
@@ -235,6 +242,39 @@ mod imp {
                     ));
                 }
             ));
+        }
+    }
+
+    impl Display {
+        fn update_cursor_visibility(&self, v: cursor::Visibility) {
+            use cursor::Visibility::*;
+            match v {
+                Show | Hide => {
+                    if let Some(id) = self.cursor_hide.take() {
+                        id.remove();
+                    }
+                    self.obj().set_cursor_visible(v == Show);
+                }
+                HideSoon => {
+                    if self.cursor_hide.borrow().is_some() {
+                        return;
+                    }
+                    let id = glib::timeout_add_local_once(
+                        cursor::PARK_GRACE,
+                        clone!(
+                            #[weak(rename_to = this)]
+                            self,
+                            move || {
+                                // Fired: forget the id (removing it now would fail).
+                                this.cursor_hide.take();
+                                log::debug!("guest cursor parked at the origin: hidden");
+                                this.obj().set_cursor_visible(false);
+                            }
+                        ),
+                    );
+                    self.cursor_hide.replace(Some(id));
+                }
+            }
         }
     }
 
@@ -407,14 +447,23 @@ mod imp {
                                             &c.data, c.width, c.height, c.hot_x, c.hot_y, 1,
                                         );
                                         this.obj().define_cursor(Some(cursor));
+                                        this.cursor_hot.set((c.hot_x, c.hot_y));
                                     }
                                     MouseSet(m) => {
+                                        log::trace!("{m:?}");
                                         if m.on != 0 {
                                             this.obj()
                                                 .set_cursor_position(Some((m.x as _, m.y as _)));
                                         } else {
                                             this.obj().set_cursor_position(None);
                                         }
+                                        this.update_cursor_visibility(cursor::on_mouse_set(
+                                            m.x,
+                                            m.y,
+                                            m.on != 0,
+                                            this.host_pos.get(),
+                                            this.cursor_hot.get(),
+                                        ));
                                     }
                                 }
                             }

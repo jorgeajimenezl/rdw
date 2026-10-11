@@ -107,6 +107,10 @@ pub trait DisplayExt: 'static {
 
     fn set_cursor_position(&self, pos: Option<(i32, i32)>);
 
+    /// Whether the remote shows its cursor. In absolute mode a hidden cursor shows no pointer
+    /// over the display, instead of the last defined shape.
+    fn set_cursor_visible(&self, visible: bool);
+
     fn grab_shortcut(&self) -> gtk::ShortcutTrigger;
 
     fn grabbed(&self) -> Grab;
@@ -327,6 +331,23 @@ impl<O: IsA<Display> + IsA<gtk::Widget> + IsA<gtk::Accessible>> DisplayExt for O
         {
             self_.imp().cursor_position.set(pos);
             self.queue_draw();
+        }
+    }
+
+    fn set_cursor_visible(&self, visible: bool) {
+        // Safety: safe because IsA<Display>
+        let self_: &Display = unsafe { self.unsafe_cast_ref::<Display>() };
+
+        #[cfg(feature = "bindings")]
+        unsafe {
+            ffi::rdw_display_set_cursor_visible(self_.to_glib_none().0, visible);
+        }
+        #[cfg(not(feature = "bindings"))]
+        {
+            let imp = self_.imp();
+            if imp.cursor_hidden.replace(!visible) != !visible {
+                imp.update_cursor();
+            }
         }
     }
 
