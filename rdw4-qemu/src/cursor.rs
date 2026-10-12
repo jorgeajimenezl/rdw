@@ -12,6 +12,17 @@
 
 use std::time::Duration;
 
+/// QEMU's `CursorDefine` pixels are ARGB 32-bit words in host byte order (BGRA bytes on a
+/// little-endian host); `rdw::Display::make_cursor` takes RGBA bytes.
+pub(crate) fn argb_to_rgba(data: &[u8]) -> Vec<u8> {
+    data.chunks_exact(4)
+        .flat_map(|p| {
+            let [a, r, g, b] = u32::from_ne_bytes([p[0], p[1], p[2], p[3]]).to_be_bytes();
+            [r, g, b, a]
+        })
+        .collect()
+}
+
 /// How long the (0,0) of a shape update may stand before it counts as hidden.
 pub(crate) const PARK_GRACE: Duration = Duration::from_millis(100);
 
@@ -104,6 +115,15 @@ mod tests {
         // A hand cursor (hot spot 6,1) with the host pointer at (6,1) is at the origin too.
         assert_eq!(on_mouse_set(0, 0, true, MOVE, Some((6, 1)), (6, 1)), Show);
         assert_eq!(on_mouse_set(0, 0, true, MOVE, Some((40, 1)), (6, 1)), Hide);
+    }
+
+    #[test]
+    fn argb_words_become_rgba_bytes() {
+        // Windows 11's busy-ring blue (0x0078d4), opaque, as QEMU sends it.
+        let px = 0xff00_78d4u32.to_ne_bytes();
+        assert_eq!(argb_to_rgba(&px), [0x00, 0x78, 0xd4, 0xff]);
+        let two = [0x8011_2233u32.to_ne_bytes(), 0x0000_0000u32.to_ne_bytes()].concat();
+        assert_eq!(argb_to_rgba(&two), [0x11, 0x22, 0x33, 0x80, 0, 0, 0, 0]);
     }
 
     /// Entering a text field, as traced on viogpudo 0.1.302: one move with the arrow, then the

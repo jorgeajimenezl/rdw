@@ -455,7 +455,12 @@ mod imp {
                                     CursorDefine(c) => {
                                         log::debug!("{c:?}");
                                         let cursor = rdw::Display::make_cursor(
-                                            &c.data, c.width, c.height, c.hot_x, c.hot_y, 1,
+                                            &cursor::argb_to_rgba(&c.data),
+                                            c.width,
+                                            c.height,
+                                            c.hot_x,
+                                            c.hot_y,
+                                            1,
                                         );
                                         this.obj().define_cursor(Some(cursor));
                                         this.cursor_hot.set((c.hot_x, c.hot_y));
