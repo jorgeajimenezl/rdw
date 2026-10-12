@@ -70,6 +70,8 @@ mod imp {
         cursor_hidden: Cell<bool>,
         // the last cursor event was a CursorDefine
         after_define: Cell<bool>,
+        // the application supplies cursor images (see Display::set_external_cursor_images)
+        pub(crate) external_cursor: Cell<bool>,
     }
 
     #[glib::object_subclass]
@@ -454,15 +456,19 @@ mod imp {
                                     }
                                     CursorDefine(c) => {
                                         log::debug!("{c:?}");
-                                        let cursor = rdw::Display::make_cursor(
-                                            &cursor::argb_to_rgba(&c.data),
-                                            c.width,
-                                            c.height,
-                                            c.hot_x,
-                                            c.hot_y,
-                                            1,
-                                        );
-                                        this.obj().define_cursor(Some(cursor));
+                                        // With external images (an agent supplies them), QEMU's are not used:
+                                        // they can be one shape late (viogpudo). The hot spot still is.
+                                        if !this.external_cursor.get() {
+                                            let cursor = rdw::Display::make_cursor(
+                                                &cursor::argb_to_rgba(&c.data),
+                                                c.width,
+                                                c.height,
+                                                c.hot_x,
+                                                c.hot_y,
+                                                1,
+                                            );
+                                            this.obj().define_cursor(Some(cursor));
+                                        }
                                         this.cursor_hot.set((c.hot_x, c.hot_y));
                                         this.after_define.set(true);
                                     }
@@ -514,6 +520,13 @@ glib::wrapper! {
 }
 
 impl Display {
+    /// Take cursor images from the application ([`rdw::DisplayExt::define_cursor`]) instead of
+    /// QEMU's `CursorDefine`. QEMU's position, visibility and hot spot still apply. For guests
+    /// whose own cursor images are unreliable, when an agent reports the real shape.
+    pub fn set_external_cursor_images(&self, external: bool) {
+        self.imp().external_cursor.set(external);
+    }
+
     /// Create a new [`Display`]. This sets up the inner [`qemu_display::Display`] and
     /// clipboard + audio handling.
     ///
