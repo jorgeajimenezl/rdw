@@ -3,6 +3,26 @@ use gst::prelude::*;
 use gst_audio::prelude::*;
 use std::{collections::HashMap, default::Default, error::Error};
 
+/// Log the pipeline's errors and warnings (nothing else reads its bus) and drop every message,
+/// so they don't pile up on it.
+fn log_bus(pipeline: &gst::Pipeline, what: &'static str) {
+    let Some(bus) = pipeline.bus() else {
+        return;
+    };
+    bus.set_sync_handler(move |_, msg| {
+        match msg.view() {
+            gst::MessageView::Error(e) => {
+                log::warn!("Audio {what} error: {} ({:?})", e.error(), e.debug())
+            }
+            gst::MessageView::Warning(w) => {
+                log::warn!("Audio {what} warning: {} ({:?})", w.error(), w.debug())
+            }
+            _ => {}
+        }
+        gst::BusSyncReply::Drop
+    });
+}
+
 #[derive(Debug)]
 struct GstAudioOut {
     pipeline: gst::Pipeline,
@@ -13,7 +33,8 @@ impl GstAudioOut {
     fn new(caps: &str) -> Result<Self, Box<dyn Error>> {
         let pipeline = &format!(
             "appsrc name=src is-live=1 do-timestamp=0 format=time caps=\"{caps}\" !\
-            queue ! decodebin ! audioconvert ! audioresample ! autoaudiosink name=sink"
+            queue ! decodebin name=decode \
+            audioconvert name=convert ! audioresample ! autoaudiosink name=sink"
         );
         let pipeline = gst::parse::launch(pipeline)?;
         let pipeline = pipeline.dynamic_cast::<gst::Pipeline>().unwrap();
@@ -22,6 +43,22 @@ impl GstAudioOut {
             .unwrap()
             .dynamic_cast::<gst_app::AppSrc>()
             .unwrap();
+        // decodebin drops its source pad when the stream is disabled (READY) and adds a new
+        // one when it plays again. gst-launch would link only the first pad, and every later
+        // stream would stop with not-linked: link each one.
+        let convert = pipeline.by_name("convert").unwrap().downgrade();
+        pipeline
+            .by_name("decode")
+            .unwrap()
+            .connect_pad_added(move |_, pad| {
+                let Some(sink) = convert.upgrade().and_then(|c| c.static_pad("sink")) else {
+                    return;
+                };
+                if let Err(e) = pad.link(&sink) {
+                    log::warn!("Failed to link the audio decoder: {e:?}");
+                }
+            });
+        log_bus(&pipeline, "output");
         Ok(Self { pipeline, src })
     }
 }
@@ -46,6 +83,7 @@ impl GstAudioIn {
             .unwrap()
             .dynamic_cast::<gst_app::AppSink>()
             .unwrap();
+        log_bus(&pipeline, "input");
         Ok(Self {
             pipeline,
             sink,
