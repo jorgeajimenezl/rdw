@@ -2,7 +2,6 @@ use super::*;
 use gtk::graphene;
 use std::cell::{Cell, RefCell};
 
-#[cfg(windows)]
 use std::cell::OnceCell;
 
 #[cfg(windows)]
@@ -31,10 +30,14 @@ pub struct Paintable {
     y0_top: Cell<Option<bool>>,
     #[cfg(unix)]
     dmabuf: RefCell<Option<Dmabuf>>,
+    /// Size and format of the GL texture's storage, once memory frames are uploaded through GL.
+    #[cfg(unix)]
+    gl_storage: Cell<Option<(i32, i32, PixelFormat)>>,
+    /// GL was unusable: memory frames go through `GdkMemoryTexture` instead.
+    #[cfg(unix)]
+    gl_failed: Cell<bool>,
 
-    #[cfg(windows)]
     ctxt: OnceCell<gdk::GLContext>,
-    #[cfg(windows)]
     texture_id: Cell<Option<gl::types::GLuint>>,
     #[cfg(windows)]
     pub(crate) win32: win32::Helper,
@@ -55,8 +58,11 @@ impl ObjectImpl for Paintable {
     fn constructed(&self) {}
 
     fn dispose(&self) {
-        #[cfg(windows)]
         if let Some(tex_id) = self.texture_id.take() {
+            #[cfg(unix)]
+            if let Some(ctxt) = self.ctxt.get() {
+                ctxt.make_current();
+            }
             unsafe {
                 gl::DeleteTextures(1, &tex_id);
             }
@@ -177,6 +183,7 @@ impl Paintable {
             if self.dmabuf.take().is_some() {
                 self.y0_top.set(None);
                 self.texture.replace(None);
+                self.gl_storage.set(None);
             }
 
             let buf_stride = max_w as usize * 4;
@@ -190,7 +197,22 @@ impl Paintable {
                     buffer[dst_start..dst_end].copy_from_slice(&data[src_start..src_end]);
                 }
             }
+            drop(buffer);
 
+            // GTK uploads a whole memory texture on every update; through GL only the damage goes.
+            #[cfg(unix)]
+            if !self.gl_failed.get() {
+                match self.upload_gl_area(x, y, w, h) {
+                    Ok(()) => return Ok(()),
+                    Err(e) => {
+                        log::warn!("GL upload unavailable, using memory textures: {e}");
+                        self.gl_failed.set(true);
+                        self.texture.replace(None);
+                    }
+                }
+            }
+
+            let buffer = self.buffer.borrow();
             let bytes = glib::Bytes::from(&*buffer);
             let region = cairo::Region::create_rectangle(&cairo::RectangleInt::new(x, y, w, h));
             let texture = gdk::MemoryTextureBuilder::new()
@@ -332,19 +354,19 @@ impl Paintable {
         Ok(())
     }
 
-    #[cfg(windows)]
     pub(crate) fn gl_context(&self) -> Result<&gdk::GLContext, glib::error::Error> {
         let ctxt = if let Some(ctxt) = self.ctxt.get() {
             ctxt
         } else {
             let ctxt = gdk::Display::default().unwrap().create_gl_context()?;
+            #[cfg(unix)]
+            ctxt.realize()?;
             self.ctxt.set(ctxt).unwrap();
             self.ctxt.get().unwrap()
         };
         Ok(ctxt)
     }
 
-    #[cfg(windows)]
     pub(crate) fn texture_id(&self) -> Result<gl::types::GLuint, glib::error::Error> {
         match self.texture_id.get() {
             None => {
@@ -409,7 +431,78 @@ impl Paintable {
         Ok(())
     }
 
-    #[cfg(windows)]
+    /// Uploads the damaged rectangle of the frame buffer to the GL texture (the whole buffer when
+    /// the storage changes), and wraps the texture for GTK.
+    #[cfg(unix)]
+    fn upload_gl_area(&self, x: i32, y: i32, w: i32, h: i32) -> Result<(), glib::error::Error> {
+        // GLES (EXT_texture_format_BGRA8888) uploads BGRA only into BGRA storage.
+        const BGRA_EXT: u32 = 0x80E1;
+        let ctxt = self.gl_context()?;
+        let gles = ctxt.api() == gdk::GLAPI::GLES;
+        ctxt.make_current();
+
+        let (max_w, max_h) = self.size();
+        let format = self.pixel_format.get();
+        let storage = (max_w, max_h, format);
+        let full = self.gl_storage.get() != Some(storage);
+        let buffer = self.buffer.borrow();
+        unsafe {
+            gl::BindTexture(gl::TEXTURE_2D, self.texture_id()?);
+            if full {
+                let internal = match (gles, format.as_opengl()) {
+                    (true, gl::BGRA) => BGRA_EXT,
+                    _ => gl::RGBA8,
+                };
+                gl::TexImage2D(
+                    gl::TEXTURE_2D,
+                    0,
+                    internal as _,
+                    max_w,
+                    max_h,
+                    0,
+                    format.as_opengl(),
+                    gl::UNSIGNED_BYTE,
+                    buffer.as_ptr() as _,
+                );
+            } else {
+                gl::PixelStorei(gl::UNPACK_ROW_LENGTH, max_w);
+                gl::PixelStorei(gl::UNPACK_SKIP_PIXELS, x);
+                gl::PixelStorei(gl::UNPACK_SKIP_ROWS, y);
+                gl::TexSubImage2D(
+                    gl::TEXTURE_2D,
+                    0,
+                    x,
+                    y,
+                    w,
+                    h,
+                    format.as_opengl(),
+                    gl::UNSIGNED_BYTE,
+                    buffer.as_ptr() as _,
+                );
+                gl::PixelStorei(gl::UNPACK_ROW_LENGTH, 0);
+                gl::PixelStorei(gl::UNPACK_SKIP_PIXELS, 0);
+                gl::PixelStorei(gl::UNPACK_SKIP_ROWS, 0);
+            }
+            let err = gl::GetError();
+            if err != gl::NO_ERROR {
+                self.gl_storage.set(None);
+                return Err(glib::Error::new(
+                    crate::Error::GL,
+                    &format!("texture upload failed: GL error {err:#x}"),
+                ));
+            }
+        }
+        drop(buffer);
+        self.gl_storage.set(Some(storage));
+
+        let region = if full {
+            cairo::RectangleInt::new(0, 0, max_w, max_h)
+        } else {
+            cairo::RectangleInt::new(x, y, w, h)
+        };
+        self.update_gl_texture(None, Some(&cairo::Region::create_rectangle(&region)))
+    }
+
     fn update_gl_texture(
         &self,
         size: Option<(i32, i32)>,
