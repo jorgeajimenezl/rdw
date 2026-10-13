@@ -8,6 +8,19 @@ use std::cell::OnceCell;
 #[cfg(windows)]
 mod win32;
 
+/// The current DMABUF scanout. Each update wraps the same buffer in a new texture.
+#[cfg(unix)]
+#[derive(Debug)]
+struct Dmabuf {
+    fds: Vec<std::os::fd::OwnedFd>,
+    width: u32,
+    height: u32,
+    offset: [u32; 4],
+    stride: [u32; 4],
+    fourcc: u32,
+    modifier: u64,
+}
+
 #[derive(Debug, Default)]
 pub struct Paintable {
     buffer: RefCell<Vec<u8>>,
@@ -16,6 +29,8 @@ pub struct Paintable {
     pixel_format: Cell<PixelFormat>,
     texture: RefCell<Option<gdk::Texture>>,
     y0_top: Cell<Option<bool>>,
+    #[cfg(unix)]
+    dmabuf: RefCell<Option<Dmabuf>>,
 
     #[cfg(windows)]
     ctxt: OnceCell<gdk::GLContext>,
@@ -157,6 +172,12 @@ impl Paintable {
             unsafe {
                 self.win32.import_d3d11_texture2d_scanout(self, None)?
             };
+            // Back from a DMABUF scanout: the old texture is not this buffer's previous content.
+            #[cfg(unix)]
+            if self.dmabuf.take().is_some() {
+                self.y0_top.set(None);
+                self.texture.replace(None);
+            }
 
             let buf_stride = max_w as usize * 4;
             let mut buffer = self.buffer.borrow_mut();
@@ -190,8 +211,19 @@ impl Paintable {
                 let region = cairo::Region::create_rectangle(&cairo::RectangleInt::new(x, y, w, h));
                 self.update_gl_texture(None, Some(&region))?;
             }
-            #[cfg(not(windows))]
-            log::warn!("update_area called with no data on non-Windows platform");
+            #[cfg(unix)]
+            if self.dmabuf.borrow().is_some() {
+                // The texture is drawn flipped when y0_top; damage is in texture rows.
+                let y = if self.y0_top.get().unwrap_or_default() {
+                    max_h - y - h
+                } else {
+                    y
+                };
+                let region = cairo::Region::create_rectangle(&cairo::RectangleInt::new(x, y, w, h));
+                unsafe { self.build_dmabuf_texture(&region)? };
+            } else {
+                log::warn!("update_area called with no data and no DMABUF scanout");
+            }
         }
 
         Ok(())
@@ -202,51 +234,87 @@ impl Paintable {
         &self,
         s: &crate::RdwDmabufScanout,
     ) -> Result<(), glib::error::Error> {
-        use std::os::unix::io::RawFd;
+        use std::os::fd::BorrowedFd;
 
-        let display = gdk::Display::default()
-            .ok_or(glib::Error::new(crate::Error::GL, "No default display"))?;
-        let num_planes = s.num_planes as usize;
+        // Keep our own fds: QEMU sends later updates of this buffer without them.
+        let fds = s.fd[..s.num_planes as usize]
+            .iter()
+            .map(|&fd| BorrowedFd::borrow_raw(fd).try_clone_to_owned())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| {
+                glib::Error::new(crate::Error::GL, &format!("Failed to dup dmabuf fd: {e}"))
+            })?;
+        self.dmabuf.replace(Some(Dmabuf {
+            fds,
+            width: s.width,
+            height: s.height,
+            offset: s.offset,
+            stride: s.stride,
+            fourcc: s.fourcc,
+            modifier: s.modifier,
+        }));
 
-        let mut dup_fds: Vec<RawFd> = Vec::with_capacity(num_planes);
-        for plane in 0..num_planes {
-            let fd = libc::dup(s.fd[plane]);
-            if fd < 0 {
-                for &duped in &dup_fds {
-                    libc::close(duped);
-                }
-                return Err(glib::Error::new(
-                    crate::Error::GL,
-                    "Failed to dup dmabuf fd",
-                ));
-            }
-            dup_fds.push(fd);
-        }
-
-        let mut builder = gdk::DmabufTextureBuilder::new()
-            .set_display(&display)
-            .set_fourcc(s.fourcc)
-            .set_modifier(s.modifier)
-            .set_width(s.width)
-            .set_height(s.height)
-            .set_n_planes(s.num_planes);
-
-        for (plane, &fd) in dup_fds.iter().enumerate() {
-            builder = builder.set_fd(plane as u32, fd);
-            builder = builder.set_offset(plane as u32, s.offset[plane]);
-            builder = builder.set_stride(plane as u32, s.stride[plane]);
-        }
-
+        self.width.set(s.width as i32);
+        self.height.set(s.height as i32);
+        self.y0_top.set(Some(s.y0_top));
+        // A new buffer: nothing carries over from the previous texture.
+        self.texture.replace(None);
         let region = cairo::Region::create_rectangle(&cairo::RectangleInt::new(
             0,
             0,
             s.width as _,
             s.height as _,
         ));
+        self.build_dmabuf_texture(&region)?;
+        self.obj().invalidate_size();
+        Ok(())
+    }
+
+    /// Wraps the current DMABUF in a new texture that differs from the previous one in `region`.
+    #[cfg(unix)]
+    unsafe fn build_dmabuf_texture(
+        &self,
+        region: &cairo::Region,
+    ) -> Result<(), glib::error::Error> {
+        use std::os::fd::IntoRawFd;
+
+        let display = gdk::Display::default()
+            .ok_or(glib::Error::new(crate::Error::GL, "No default display"))?;
+        let dmabuf = self.dmabuf.borrow();
+        let Some(d) = dmabuf.as_ref() else {
+            return Ok(());
+        };
+
+        // The texture owns its own copies, closed when GTK releases it.
+        let dup_fds: Vec<_> = d
+            .fds
+            .iter()
+            .map(|fd| fd.try_clone())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| {
+                glib::Error::new(crate::Error::GL, &format!("Failed to dup dmabuf fd: {e}"))
+            })?
+            .into_iter()
+            .map(IntoRawFd::into_raw_fd)
+            .collect();
+
+        let mut builder = gdk::DmabufTextureBuilder::new()
+            .set_display(&display)
+            .set_fourcc(d.fourcc)
+            .set_modifier(d.modifier)
+            .set_width(d.width)
+            .set_height(d.height)
+            .set_n_planes(d.fds.len() as u32);
+
+        for (plane, &fd) in dup_fds.iter().enumerate() {
+            builder = builder.set_fd(plane as u32, fd);
+            builder = builder.set_offset(plane as u32, d.offset[plane]);
+            builder = builder.set_stride(plane as u32, d.stride[plane]);
+        }
 
         let texture = builder
             .set_update_texture(self.texture.borrow().as_ref())
-            .set_update_region(Some(&region))
+            .set_update_region(Some(region))
             .build_with_release_func(move || {
                 for fd in dup_fds {
                     libc::close(fd);
@@ -259,11 +327,7 @@ impl Paintable {
                 )
             })?;
 
-        self.width.set(s.width as i32);
-        self.height.set(s.height as i32);
-        self.y0_top.set(Some(s.y0_top));
         self.texture.replace(Some(texture));
-        self.obj().invalidate_size();
         self.obj().invalidate_contents();
         Ok(())
     }
