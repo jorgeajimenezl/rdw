@@ -36,6 +36,10 @@ pub struct Paintable {
     /// GL was unusable: memory frames go through `GdkMemoryTexture` instead.
     #[cfg(unix)]
     gl_failed: Cell<bool>,
+    /// Fence syncs of textures GTK has released, deleted on the next upload. The builder leaves
+    /// them to us, and the release function may run off the main thread.
+    #[cfg(unix)]
+    released_syncs: std::sync::Arc<std::sync::Mutex<Vec<usize>>>,
 
     ctxt: OnceCell<gdk::GLContext>,
     texture_id: Cell<Option<gl::types::GLuint>>,
@@ -62,6 +66,7 @@ impl ObjectImpl for Paintable {
             #[cfg(unix)]
             if let Some(ctxt) = self.ctxt.get() {
                 ctxt.make_current();
+                self.delete_released_syncs();
             }
             unsafe {
                 gl::DeleteTextures(1, &tex_id);
@@ -503,6 +508,14 @@ impl Paintable {
         self.update_gl_texture(None, Some(&cairo::Region::create_rectangle(&region)))
     }
 
+    /// Deletes the syncs of released textures. Our GL context must be current.
+    #[cfg(unix)]
+    fn delete_released_syncs(&self) {
+        for sync in self.released_syncs.lock().unwrap().drain(..) {
+            unsafe { gl::DeleteSync(sync as gl::types::GLsync) };
+        }
+    }
+
     fn update_gl_texture(
         &self,
         size: Option<(i32, i32)>,
@@ -510,6 +523,8 @@ impl Paintable {
     ) -> Result<(), glib::error::Error> {
         let ctxt = self.gl_context()?;
         ctxt.make_current();
+        #[cfg(unix)]
+        self.delete_released_syncs();
 
         let (w, h) = size.unwrap_or_else(|| self.size());
         let texture = unsafe {
@@ -531,6 +546,17 @@ impl Paintable {
             } else {
                 builder.set_sync(Some(sync as _))
             };
+            #[cfg(unix)]
+            {
+                let released = self.released_syncs.clone();
+                let sync = sync as usize;
+                builder.build_with_release_func(move || {
+                    if sync != 0 {
+                        released.lock().unwrap().push(sync);
+                    }
+                })
+            }
+            #[cfg(not(unix))]
             builder.build()
         };
         self.texture.replace(Some(texture));
