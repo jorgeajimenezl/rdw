@@ -773,9 +773,12 @@ impl Display {
     }
 
     fn key_released(&self, _ec: &gtk::EventControllerKey, keyval: gdk::Key, keycode: u32) {
-        // FIXME: it also receives release events for keys that didn't get press events...
-        // ex: ctrl-alt-down
-        if self.delayed_grab_shortcut.take() {
+        // It also gets releases of keys whose press it never saw (ex: ctrl-alt-down, the down
+        // press taken by the compositor or an ancestor): those neither end the grab shortcut
+        // nor reach the guest.
+        let seen = self.last_key_press.get() == Some((keyval, keycode))
+            || self.keys_pressed.borrow().contains(&(keyval, keycode));
+        if self.delayed_grab_shortcut.take() && seen {
             if self.grabbed.get().is_empty() {
                 self.try_grab();
             } else {
@@ -796,7 +799,7 @@ impl Display {
         self.emit_last_key_press();
 
         self.keys_pressed.borrow_mut().remove(&(keyval, keycode));
-        if !emitted {
+        if seen && !emitted {
             self.do_key_release(keyval, keycode)
         }
     }
