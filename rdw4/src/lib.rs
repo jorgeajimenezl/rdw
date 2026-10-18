@@ -1,3 +1,4 @@
+pub use gst;
 pub use gtk;
 
 mod content_provider;

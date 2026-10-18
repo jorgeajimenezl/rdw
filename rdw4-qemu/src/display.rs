@@ -58,6 +58,8 @@ mod imp {
         scanout_map: RefCell<Option<ScanoutMmap>>,
         #[allow(unused)] // only here to keep it alive
         pub(crate) audio_handler: RefCell<Option<audio::Handler>>,
+        /// The host source the guest's microphone records from.
+        pub(crate) audio_input: rdw::AudioInput,
         #[allow(unused)] // only here to keep it alive
         pub(crate) clipboard_handler: RefCell<Option<clipboard::Handler>>,
         // last absolute position sent to the guest
@@ -527,6 +529,12 @@ impl Display {
         self.imp().external_cursor.set(external);
     }
 
+    /// Which host source the guest's microphone records from (the desktop's default until
+    /// set). A change applies at once, also to a recording under way.
+    pub fn audio_input(&self) -> rdw::AudioInput {
+        self.imp().audio_input.clone()
+    }
+
     /// Create a new [`Display`]. This sets up the inner [`qemu_display::Display`] and
     /// clipboard + audio handling.
     ///
@@ -599,7 +607,7 @@ impl Display {
         let slf = Display::new_for_console(console);
 
         let audio_handler = if let Ok(Some(audio)) = q_display.audio().await {
-            audio::Handler::new(audio)
+            audio::Handler::new(audio, slf.imp().audio_input.clone())
                 .await
                 .inspect_err(|e| log::warn!("Failed to setup audio handler: {}", e))
                 .ok()

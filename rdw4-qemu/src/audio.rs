@@ -93,10 +93,11 @@ impl AudioInHandler for InListener {
 }
 
 impl Handler {
-    pub async fn new(mut audio: Audio) -> Result<Handler, Box<dyn Error>> {
+    /// The guest's microphone records from the source `input` names.
+    pub async fn new(mut audio: Audio, input: rdw::AudioInput) -> Result<Handler, Box<dyn Error>> {
         let gst = rdw::GstAudio::new()?;
         audio.register_out_listener(OutListener { gst }).await?;
-        let gst = rdw::GstAudio::new()?;
+        let gst = rdw::GstAudio::with_input(input)?;
         audio.register_in_listener(InListener { gst }).await?;
         Ok(Handler { audio })
     }
