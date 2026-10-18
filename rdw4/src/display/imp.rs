@@ -775,9 +775,14 @@ impl Display {
     fn key_released(&self, _ec: &gtk::EventControllerKey, keyval: gdk::Key, keycode: u32) {
         // It also gets releases of keys whose press it never saw (ex: ctrl-alt-down, the down
         // press taken by the compositor or an ancestor): those neither end the grab shortcut
-        // nor reach the guest.
-        let seen = self.last_key_press.get() == Some((keyval, keycode))
-            || self.keys_pressed.borrow().contains(&(keyval, keycode));
+        // nor reach the guest. By keycode: a key's keyval can change between its press and its
+        // release (shift released first).
+        let seen = self.last_key_press.get().is_some_and(|(_, c)| c == keycode)
+            || self
+                .keys_pressed
+                .borrow()
+                .iter()
+                .any(|&(_, c)| c == keycode);
         if self.delayed_grab_shortcut.take() && seen {
             if self.grabbed.get().is_empty() {
                 self.try_grab();
@@ -798,7 +803,9 @@ impl Display {
         // flush pending key event
         self.emit_last_key_press();
 
-        self.keys_pressed.borrow_mut().remove(&(keyval, keycode));
+        self.keys_pressed
+            .borrow_mut()
+            .retain(|&(_, c)| c != keycode);
         if seen && !emitted {
             self.do_key_release(keyval, keycode)
         }
