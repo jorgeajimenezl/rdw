@@ -83,33 +83,16 @@ impl GstAudioOut {
 /// handle: the input streams of every [`GstAudio`] made with it follow a change, also while
 /// they record.
 #[derive(Debug, Clone, Default)]
-pub struct AudioInput(Arc<Mutex<InputChoice>>);
-
-#[derive(Debug, Default)]
-struct InputChoice {
-    device: Option<gst::Device>,
-    /// Counts the changes, so a stream can tell it records from an older choice.
-    generation: u64,
-}
+pub struct AudioInput(Arc<Mutex<Option<gst::Device>>>);
 
 impl AudioInput {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
+    /// Setting the device already set changes nothing.
     pub fn set_device(&self, device: Option<gst::Device>) {
-        let mut c = self.0.lock().unwrap();
-        c.device = device;
-        c.generation += 1;
+        *self.0.lock().unwrap() = device;
     }
 
     pub fn device(&self) -> Option<gst::Device> {
-        self.0.lock().unwrap().device.clone()
-    }
-
-    fn current(&self) -> (Option<gst::Device>, u64) {
-        let c = self.0.lock().unwrap();
-        (c.device.clone(), c.generation)
+        self.0.lock().unwrap().clone()
     }
 }
 
@@ -118,26 +101,28 @@ struct GstAudioIn {
     caps: String,
     pipeline: gst::Pipeline,
     sink: gst_app::AppSink,
+    /// The guest's mute and volume, applied after the source: a source's own volume is the
+    /// host's for that microphone, and this element keeps its value in NULL.
+    volume: gst_audio::StreamVolume,
     /// What the source delivered beyond the last read.
     queue: Vec<u8>,
     /// One frame of silence in the stream's format.
     silence: Vec<u8>,
     enabled: bool,
-    /// The [`AudioInput`] generation the pipeline was built for.
-    generation: u64,
-    /// The guest's mute and volume (cubic), kept for a pipeline built later.
-    mute: bool,
-    volume: Option<f64>,
+    /// The [`AudioInput`] device the pipeline was built for, even when it fell back to the
+    /// default.
+    wanted: Option<gst::Device>,
     /// A read waited [`READ_TIMEOUT`] for nothing: the next reads answer at once, with what
     /// came meanwhile and silence, until the source delivers again.
     stalled: bool,
 }
 
 impl GstAudioIn {
+    /// A pipeline recording from `device`, for a stream that asked for `wanted`.
     fn new(
         caps: &str,
         device: Option<&gst::Device>,
-        generation: u64,
+        wanted: Option<gst::Device>,
     ) -> Result<Self, Box<dyn Error>> {
         let gst_caps = gst::Caps::from_str(caps)?;
         let info = gst_audio::AudioInfo::from_caps(&gst_caps)?;
@@ -157,9 +142,7 @@ impl GstAudioIn {
             .property("max-size-bytes", 0u32)
             .build()?;
         let convert = gst::ElementFactory::make("audioconvert").build()?;
-        // The guest's volume, here rather than on the source: a source's own volume is the
-        // host's for that microphone, and an element keeps its value in NULL.
-        let volume = gst::ElementFactory::make("volume").name("volume").build()?;
+        let volume = gst::ElementFactory::make("volume").build()?;
         let resample = gst::ElementFactory::make("audioresample").build()?;
         let sink = gst_app::AppSink::builder()
             .name("sink")
@@ -184,29 +167,13 @@ impl GstAudioIn {
             caps: caps.to_owned(),
             pipeline,
             sink,
+            volume: volume.dynamic_cast().unwrap(),
             queue: Default::default(),
             silence,
             enabled: false,
-            generation,
-            mute: false,
-            volume: None,
+            wanted,
             stalled: false,
         })
-    }
-
-    fn apply_volume(&self) {
-        let Some(volume) = self.pipeline.by_name("volume") else {
-            return;
-        };
-        volume.set_property("mute", self.mute);
-        if let Some(v) = self.volume {
-            let linear = gst_audio::StreamVolume::convert_volume(
-                gst_audio::StreamVolumeFormat::Cubic,
-                gst_audio::StreamVolumeFormat::Linear,
-                v,
-            );
-            volume.set_property("volume", linear);
-        }
     }
 
     /// Add a sample's audio to the queue.
@@ -226,9 +193,8 @@ impl GstAudioIn {
     /// Fill the queue up to `size` with silence.
     fn pad(&mut self, size: usize) {
         let missing = size.saturating_sub(self.queue.len());
-        let frames = missing.div_ceil(self.silence.len());
-        let silence = self.silence.repeat(frames);
-        self.queue.extend_from_slice(&silence[..missing]);
+        let silence = self.silence.iter().copied().cycle().take(missing);
+        self.queue.extend(silence);
     }
 }
 
@@ -272,7 +238,6 @@ impl GstAudio {
         let pipeline = gst::Pipeline::new();
         pipeline.add(&gst::ElementFactory::make("decodebin").build()?)?;
         let can_decode = if let Some(sink) = pipeline.pad_template("sink") {
-            use std::str::FromStr;
             let caps = gst::Caps::from_str(mime).unwrap();
             sink.caps().can_intersect(&caps)
         } else {
@@ -344,8 +309,8 @@ impl GstAudio {
             return Err(format!("id {id} is already setup").into());
         }
 
-        let (device, generation) = self.input.current();
-        let in_ = GstAudioIn::new(caps, device.as_ref(), generation)?;
+        let device = self.input.device();
+        let in_ = GstAudioIn::new(caps, device.as_ref(), device.clone())?;
         log::debug!(
             "Audio input {id}: {caps}, from {}",
             device_name(device.as_ref())
@@ -367,22 +332,21 @@ impl GstAudio {
     /// The stream, its pipeline rebuilt first if the [`AudioInput`] changed since it was made.
     /// A device that can't record, or can't start, falls back to the default source.
     fn follow_input(&mut self, id: u64) -> Result<&mut GstAudioIn, Box<dyn Error>> {
-        let (device, generation) = self.input.current();
-        let in_ = self
-            .in_
-            .get_mut(&id)
-            .ok_or_else(|| format!("Stream not found: {id}"))?;
-        if in_.generation != generation {
+        let device = self.input.device();
+        let in_ = self.get_in_mut(id)?;
+        if in_.wanted != device {
             log::info!(
                 "Audio input {id}: recording from {}",
                 device_name(device.as_ref())
             );
-            let build = |device: Option<&gst::Device>| -> Result<GstAudioIn, Box<dyn Error>> {
-                let mut new = GstAudioIn::new(&in_.caps, device, generation)?;
+            let build = |from: Option<&gst::Device>| -> Result<GstAudioIn, Box<dyn Error>> {
+                let mut new = GstAudioIn::new(&in_.caps, from, device.clone())?;
                 new.enabled = in_.enabled;
-                new.mute = in_.mute;
-                new.volume = in_.volume;
-                new.apply_volume();
+                new.volume.set_mute(in_.volume.is_muted());
+                new.volume.set_volume(
+                    gst_audio::StreamVolumeFormat::Linear,
+                    in_.volume.volume(gst_audio::StreamVolumeFormat::Linear),
+                );
                 if new.enabled {
                     new.pipeline.set_state(gst::State::Playing)?;
                 }
@@ -427,48 +391,47 @@ impl GstAudio {
         vol: Option<f64>,
     ) -> Result<(), Box<dyn Error>> {
         let in_ = self.get_in_mut(id)?;
-        in_.mute = mute;
-        if vol.is_some() {
-            in_.volume = vol;
+        in_.volume.set_mute(mute);
+        if let Some(vol) = vol {
+            in_.volume
+                .set_volume(gst_audio::StreamVolumeFormat::Cubic, vol);
         }
-        in_.apply_volume();
         Ok(())
     }
 
     pub async fn read_in(&mut self, id: u64, size: u64) -> Result<Vec<u8>, Box<dyn Error>> {
         let size = size as usize;
         let in_ = self.follow_input(id)?;
-        // Stalled: take what came since without waiting; the source is back once it delivers.
-        if in_.stalled {
-            while in_.queue.len() < size {
-                let Some(sample) = in_.sink.try_pull_sample(gst::ClockTime::ZERO) else {
-                    break;
-                };
-                in_.push(&sample)?;
-                in_.stalled = false;
-            }
-            if in_.stalled {
-                in_.pad(size);
-            }
-        }
-        let mut stream = in_.sink.stream();
-        let clock = gst::SystemClock::obtain();
+        // What came already; no timer when it is enough.
         while in_.queue.len() < size {
-            let timeout = clock
+            let Some(sample) = in_.sink.try_pull_sample(gst::ClockTime::ZERO) else {
+                break;
+            };
+            in_.push(&sample)?;
+            in_.stalled = false;
+        }
+        // Wait for the rest, at most READ_TIMEOUT in all; a stalled source isn't waited for.
+        if in_.queue.len() < size && !in_.stalled {
+            let clock = gst::SystemClock::obtain();
+            let mut timeout = clock
                 .new_single_shot_id(clock.time() + READ_TIMEOUT)
                 .wait_async_future()?;
-            match future::select(stream.next(), timeout).await {
-                Either::Left((Some(sample), _)) => in_.push(&sample)?,
-                Either::Left((None, _)) => return Err("EOS?".into()),
-                Either::Right(_) => {
-                    log::debug!(
-                        "Audio input {id}: no input for {READ_TIMEOUT}, silence until it comes"
-                    );
-                    in_.stalled = true;
-                    in_.pad(size);
+            let mut stream = in_.sink.stream();
+            while in_.queue.len() < size {
+                match future::select(stream.next(), &mut timeout).await {
+                    Either::Left((Some(sample), _)) => in_.push(&sample)?,
+                    Either::Left((None, _)) => return Err("EOS?".into()),
+                    Either::Right(_) => {
+                        log::debug!(
+                            "Audio input {id}: no input for {READ_TIMEOUT}, silence until it comes"
+                        );
+                        in_.stalled = true;
+                        break;
+                    }
                 }
             }
         }
+        in_.pad(size);
         let remainder = in_.queue.split_off(size);
         Ok(std::mem::replace(&mut in_.queue, remainder))
     }
