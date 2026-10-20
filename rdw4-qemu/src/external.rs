@@ -6,13 +6,13 @@
 pub(crate) enum ConsoleFrame {
     #[default]
     None,
-    /// A memory scanout (`Scanout`/`Update`). Its pixels are kept only while the source is
-    /// external: `None` when the scanout came before.
+    /// A memory scanout (`Scanout`/`Update`), with its pixels: QEMU sends no update of a still
+    /// console, so the pixels shown before the source turned external are needed too.
     Memory {
         width: u32,
         height: u32,
         stride: u32,
-        data: Option<Vec<u8>>,
+        data: Vec<u8>,
     },
     /// A shared-memory scanout, whose mapping is the display's `scanout_map`.
     Map { width: u32, height: u32 },
@@ -22,7 +22,7 @@ pub(crate) enum ConsoleFrame {
 }
 
 impl ConsoleFrame {
-    /// Applies a memory update to the recorded pixels, if there are any.
+    /// Applies a memory update to the recorded pixels of a memory scanout.
     pub(crate) fn apply_update(
         &mut self,
         x: u32,
@@ -36,7 +36,7 @@ impl ConsoleFrame {
             width,
             height,
             stride,
-            data: Some(data),
+            data,
         } = self
         {
             copy_rect(
@@ -137,25 +137,20 @@ mod tests {
     }
 
     #[test]
-    fn updates_apply_only_to_recorded_pixels() {
+    fn updates_apply_to_recorded_pixels() {
         let src = vec![5u8; 4];
-        let mut f = ConsoleFrame::Memory {
-            width: 2,
-            height: 2,
-            stride: 8,
-            data: None,
-        };
+        let mut f = ConsoleFrame::None;
         f.apply_update(0, 0, 1, 1, 4, &src);
-        assert!(matches!(f, ConsoleFrame::Memory { data: None, .. }));
+        assert!(matches!(f, ConsoleFrame::None));
 
         let mut f = ConsoleFrame::Memory {
             width: 2,
             height: 2,
             stride: 8,
-            data: Some(frame(2, 2)),
+            data: frame(2, 2),
         };
         f.apply_update(1, 1, 1, 1, 4, &src);
-        let ConsoleFrame::Memory { data: Some(d), .. } = f else {
+        let ConsoleFrame::Memory { data: d, .. } = f else {
             unreachable!()
         };
         assert_eq!(px(&d, 8, 1, 1), 5);

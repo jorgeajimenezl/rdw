@@ -302,10 +302,7 @@ mod imp {
                 } => {
                     obj.set_display_pixel_format(rdw::PixelFormat::Bgrx);
                     obj.set_display_size(Some((*width as _, *height as _)));
-                    // Without the pixels (the scanout came before), the next updates repaint.
-                    if let Some(data) = data.take() {
-                        obj.update_area(0, 0, *width as _, *height as _, *stride as _, Some(&data));
-                    }
+                    obj.update_area(0, 0, *width as _, *height as _, *stride as _, Some(data));
                 }
                 ConsoleFrame::Map { width, height } => {
                     if let Some(map) = self.scanout_map.borrow().as_ref() {
@@ -414,14 +411,15 @@ mod imp {
                                             log::warn!("Format not yet supported: {:X}", s.format);
                                             continue;
                                         }
-                                        let external = this.external_source.get();
+                                        // Kept whether or not the source is external now: a
+                                        // still console sends no update to repaint it later.
                                         this.console_frame.replace(ConsoleFrame::Memory {
                                             width: s.width,
                                             height: s.height,
                                             stride: s.stride,
-                                            data: external.then(|| s.data.clone()),
+                                            data: s.data.clone(),
                                         });
-                                        if external {
+                                        if this.external_source.get() {
                                             continue;
                                         }
                                         this.obj().set_display_pixel_format(rdw::PixelFormat::Bgrx);
@@ -441,11 +439,11 @@ mod imp {
                                             log::warn!("Format not yet supported: {:X}", u.format);
                                             continue;
                                         }
+                                        this.console_frame.borrow_mut().apply_update(
+                                            u.x as _, u.y as _, u.w as _, u.h as _, u.stride,
+                                            &u.data,
+                                        );
                                         if this.external_source.get() {
-                                            this.console_frame.borrow_mut().apply_update(
-                                                u.x as _, u.y as _, u.w as _, u.h as _, u.stride,
-                                                &u.data,
-                                            );
                                             continue;
                                         }
                                         this.obj().update_area(
