@@ -52,6 +52,11 @@ impl Paintable {
         unsafe { self.imp().import_dmabuf(s) }
     }
 
+    #[cfg(unix)]
+    pub fn dmabuf_import_failed(&self) -> bool {
+        self.imp().import_failed()
+    }
+
     #[cfg(windows)]
     pub(crate) fn import_d3d11_texture2d_scanout(
         &self,

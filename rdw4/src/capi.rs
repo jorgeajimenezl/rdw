@@ -224,6 +224,17 @@ pub extern "C" fn rdw_display_set_dmabuf_scanout(
     this.set_dmabuf_scanout(dmabuf);
 }
 
+/// rdw_display_get_dmabuf_import_failed:
+/// @dpy: A #RdwDisplay
+///
+/// Returns: whether a DMABUF import or copy failed, so each DMABUF update is a new texture
+#[cfg(unix)]
+#[no_mangle]
+pub extern "C" fn rdw_display_get_dmabuf_import_failed(dpy: *mut RdwDisplay) -> bool {
+    let this: &Display = unsafe { &from_glib_borrow(dpy) };
+    this.dmabuf_import_failed()
+}
+
 /// rdw_display_set_d3d11_texture2d_scanout:
 /// @dpy: A #RdwDisplay
 #[cfg(windows)]

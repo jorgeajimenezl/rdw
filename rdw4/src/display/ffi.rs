@@ -41,6 +41,9 @@ extern "C" {
     #[cfg(unix)]
     pub fn rdw_display_set_dmabuf_scanout(dpy: *mut RdwDisplay, dmabuf: *const RdwDmabufScanout);
 
+    #[cfg(unix)]
+    pub fn rdw_display_get_dmabuf_import_failed(dpy: *mut RdwDisplay) -> bool;
+
     #[cfg(windows)]
     pub fn rdw_display_set_d3d11_texture2d_scanout(
         dpy: *mut RdwDisplay,

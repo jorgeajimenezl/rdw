@@ -123,8 +123,18 @@ pub trait DisplayExt: 'static {
     #[cfg(windows)]
     fn set_d3d11_texture2d_can_acquire(&self, can_acquire: bool);
 
+    /// Shows a DMABUF. Each buffer is imported once and the import kept (a few at once), so a
+    /// source can switch between its buffers every frame: `update_area` without data then copies
+    /// the damage on the GPU from the current buffer. A new buffer, or a change of the display's
+    /// size or format, copies the whole buffer.
     #[cfg(unix)]
     fn set_dmabuf_scanout(&self, s: RdwDmabufScanout);
+
+    /// Whether a DMABUF import or copy failed: then each DMABUF update is shown as a new
+    /// texture, which costs an import per frame, and a source with the pixels at hand may
+    /// rather pass them to `update_area`.
+    #[cfg(unix)]
+    fn dmabuf_import_failed(&self) -> bool;
 
     fn set_alternative_text(&self, alt_text: &str);
 
@@ -444,6 +454,21 @@ impl<O: IsA<Display> + IsA<gtk::Widget> + IsA<gtk::Accessible>> DisplayExt for O
             if let Err(e) = imp.picture.paintable().import_dmabuf(&s) {
                 log::warn!("Failed to import DMABUF: {e}");
             }
+        }
+    }
+
+    #[cfg(unix)]
+    fn dmabuf_import_failed(&self) -> bool {
+        // Safety: safe because IsA<Display>
+        let self_: &Display = unsafe { self.unsafe_cast_ref::<Display>() };
+
+        #[cfg(feature = "bindings")]
+        unsafe {
+            ffi::rdw_display_get_dmabuf_import_failed(self_.to_glib_none().0)
+        }
+        #[cfg(all(unix, not(feature = "bindings")))]
+        {
+            self_.imp().picture.paintable().dmabuf_import_failed()
         }
     }
 
