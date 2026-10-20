@@ -12,7 +12,7 @@
 //! - `--dmabuf`: hand rdw each slot's DMABUF (default: the damaged pixels).
 //! - `--full`: repaint the whole frame each tick (default: a moving 100 px square).
 //! - `--check`: every 30 frames, render the display offscreen and compare the square's centre
-//!   with what was written.
+//!   with what was written. The colour then changes every frame, which flashes on screen.
 //! - `--seconds N`: quit after N seconds, printing the totals.
 //!
 //! Each second prints frames/s and the process's CPU (user + system, and system alone).
@@ -34,7 +34,8 @@ const SQUARE: i32 = 100;
 const DRM_FORMAT_XRGB8888: u32 = u32::from_le_bytes(*b"XR24");
 const DRM_FORMAT_MOD_LINEAR: u64 = 0;
 const BACKGROUND: u32 = 0xff20_2020;
-// Distinct square colours, one per frame in turn, so a stale frame shows the wrong one.
+// Distinct square colours, one per frame in turn under --check, so a stale frame shows the
+// wrong one.
 const COLOURS: [u32; 7] = [
     0xffff_0000,
     0xff00_ff00,
@@ -246,8 +247,14 @@ impl Source {
         cairo::RectangleInt::new(x, (self.o.height - SQUARE) / 2, SQUARE, SQUARE)
     }
 
-    fn colour(frame: u64) -> u32 {
-        COLOURS[frame as usize % COLOURS.len()]
+    /// The square's colour (the whole frame's with `--full`): steady, or with `--check` a new
+    /// one each frame, so a stale frame shows the wrong one. That flashes on screen.
+    fn colour(&self, frame: u64) -> u32 {
+        if self.o.check {
+            COLOURS[frame as usize % COLOURS.len()]
+        } else {
+            COLOURS[0]
+        }
     }
 
     /// Writes the next frame into its slot; returns the slot and the damage against the frame
@@ -257,7 +264,7 @@ impl Source {
         let i = frame as usize % SLOTS;
         let whole = cairo::RectangleInt::new(0, 0, self.o.width, self.o.height);
         if self.o.full {
-            self.slots.fill(i, &whole, Self::colour(frame));
+            self.slots.fill(i, &whole, self.colour(frame));
             self.square_in[i] = None;
             return (i, vec![whole]);
         }
@@ -266,7 +273,7 @@ impl Source {
             None => self.slots.fill(i, &whole, BACKGROUND),
         }
         let square = self.square(frame);
-        self.slots.fill(i, &square, Self::colour(frame));
+        self.slots.fill(i, &square, self.colour(frame));
         self.square_in[i] = Some(square);
         let damage = match self.shown.replace(square) {
             Some(prev) => vec![prev, square],
@@ -395,7 +402,7 @@ fn activate(app: &gtk::Application, o: Options) {
                 let sq = s.square(s.frame);
                 (sq.x() + SQUARE / 2, sq.y() + SQUARE / 2)
             };
-            let expected = Source::colour(s.frame);
+            let expected = s.colour(s.frame);
             let (n, stale) = checks.get();
             match read_back(display, &s.o, x, y) {
                 Some(got) if got == expected => checks.set((n + 1, stale)),
