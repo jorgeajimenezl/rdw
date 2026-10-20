@@ -33,12 +33,29 @@ impl ObjectImpl for Picture {
                 this.obj().queue_resize();
             }
         ));
+        // The device-pixel size follows the scale too.
+        self.obj()
+            .connect_scale_factor_notify(|obj| obj.queue_allocate());
     }
 }
 
 impl WidgetImpl for Picture {
     fn request_mode(&self) -> gtk::SizeRequestMode {
         gtk::SizeRequestMode::HeightForWidth
+    }
+
+    fn size_allocate(&self, width: i32, height: i32, baseline: i32) {
+        self.parent_size_allocate(width, height, baseline);
+        let obj = self.obj();
+        // The surface's scale is fractional; the widget's scale factor is rounded up.
+        let scale = obj
+            .native()
+            .and_then(|n| n.surface())
+            .map_or(obj.scale_factor() as f64, |s| s.scale());
+        self.paintable.set_shown_size(
+            (width as f64 * scale).round() as i32,
+            (height as f64 * scale).round() as i32,
+        );
     }
 
     fn snapshot(&self, snapshot: &gtk::Snapshot) {

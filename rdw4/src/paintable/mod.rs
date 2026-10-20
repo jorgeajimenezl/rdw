@@ -35,6 +35,11 @@ impl Paintable {
         self.imp().size()
     }
 
+    /// The size the picture is drawn at, in device pixels: damage grows on a scaled picture.
+    pub(crate) fn set_shown_size(&self, w: i32, h: i32) {
+        self.imp().set_shown_size(w, h)
+    }
+
     pub fn update_area(
         &self,
         x: i32,

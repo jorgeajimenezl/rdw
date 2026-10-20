@@ -85,6 +85,8 @@ pub struct Paintable {
     pixel_format: Cell<PixelFormat>,
     texture: RefCell<Option<gdk::Texture>>,
     y0_top: Cell<Option<bool>>,
+    /// The size it's drawn at, in device pixels, for the damage margin.
+    shown: Cell<(i32, i32)>,
     #[cfg(unix)]
     dmabuf: RefCell<Option<Dmabuf>>,
     /// Size and format of the GL texture's storage, once memory frames are uploaded through GL.
@@ -178,6 +180,25 @@ impl Paintable {
 
     pub(crate) fn size(&self) -> (i32, i32) {
         (self.width.get(), self.height.get())
+    }
+
+    /// The size the picture is drawn at, in device pixels (its widget sets it).
+    pub(crate) fn set_shown_size(&self, w: i32, h: i32) {
+        self.shown.set((w, h));
+    }
+
+    /// GTK's update region for a change of `r`: grown by [`damage_margin`] when the picture
+    /// is scaled, inside the texture.
+    fn damage_region(&self, r: cairo::RectangleInt) -> cairo::Region {
+        let (w, h) = self.size();
+        let m = damage_margin((w, h), self.shown.get());
+        let grown = cairo::RectangleInt::new(
+            r.x().saturating_sub(m),
+            r.y().saturating_sub(m),
+            r.width().saturating_add(2 * m),
+            r.height().saturating_add(2 * m),
+        );
+        cairo::Region::create_rectangle(&clamp_rect(&grown, w, h).unwrap_or(r))
     }
 
     fn memory_format(format: PixelFormat) -> gdk::MemoryFormat {
@@ -295,7 +316,7 @@ impl Paintable {
 
             let buffer = self.buffer.borrow();
             let bytes = glib::Bytes::from(&*buffer);
-            let region = cairo::Region::create_rectangle(&cairo::RectangleInt::new(x, y, w, h));
+            let region = self.damage_region(cairo::RectangleInt::new(x, y, w, h));
             let texture = gdk::MemoryTextureBuilder::new()
                 .set_bytes(Some(&bytes))
                 .set_format(Self::memory_format(self.pixel_format.get()))
@@ -311,7 +332,7 @@ impl Paintable {
             #[cfg(windows)]
             if self.win32.has_texture() {
                 self.win32.update_texture(self, x, y, w, h)?;
-                let region = cairo::Region::create_rectangle(&cairo::RectangleInt::new(x, y, w, h));
+                let region = self.damage_region(cairo::RectangleInt::new(x, y, w, h));
                 self.update_gl_texture(None, Some(&region))?;
             }
             #[cfg(unix)]
@@ -329,7 +350,7 @@ impl Paintable {
                         Err(e) => self.fail_imports(e),
                     }
                 }
-                let region = cairo::Region::create_rectangle(&rect);
+                let region = self.damage_region(rect);
                 unsafe { self.build_dmabuf_texture(&region)? };
             } else {
                 log::warn!("update_area called with no data and no DMABUF scanout");
@@ -589,7 +610,7 @@ impl Paintable {
         } else {
             cairo::RectangleInt::new(x, y, w, h)
         };
-        self.update_gl_texture(None, Some(&cairo::Region::create_rectangle(&region)))
+        self.update_gl_texture(None, Some(&self.damage_region(region)))
     }
 
     /// Imports the current DMABUF into a GL texture of its own. The EGL image holds the buffer.
@@ -811,7 +832,7 @@ impl Paintable {
         }
         drop(dmabuf);
         self.gl_storage.set(Some(storage));
-        self.update_gl_texture(None, Some(&cairo::Region::create_rectangle(&rect)))
+        self.update_gl_texture(None, Some(&self.damage_region(rect)))
     }
 
     /// Gives up on kept imports for good: each DMABUF update becomes a new texture.
@@ -929,8 +950,21 @@ impl Paintable {
     }
 }
 
+/// How far damage grows on a `source`-sized texture drawn over `shown` device pixels: the
+/// scaling filter reads past the changed texels, and GTK repaints only the update region, so
+/// without a margin the old pixels around a change stay on screen. None at 1:1 (or before the
+/// first allocation); else at least a pixel, and a texel per unit of downscale.
+fn damage_margin(source: (i32, i32), shown: (i32, i32)) -> i32 {
+    if source == shown || shown.0 <= 0 || shown.1 <= 0 || source.0 <= 0 || source.1 <= 0 {
+        return 0;
+    }
+    let ratio = |s: i32, d: i32| (s as u32).div_ceil(d as u32) as i32;
+    ratio(source.0, shown.0)
+        .max(ratio(source.1, shown.1))
+        .max(1)
+}
+
 /// `r` clipped to a `w`×`h` frame, or `None` when nothing is left.
-#[cfg(unix)]
 fn clamp_rect(r: &cairo::RectangleInt, w: i32, h: i32) -> Option<cairo::RectangleInt> {
     let x0 = r.x().clamp(0, w);
     let y0 = r.y().clamp(0, h);
@@ -965,5 +999,19 @@ mod tests {
         assert_eq!(clamp_rect(&rect(0, 0, 0, 10), 100, 100), None);
         assert_eq!(clamp_rect(&rect(0, 0, -10, 10), 100, 100), None);
         assert_eq!(clamp_rect(&rect(i32::MAX, 0, i32::MAX, 1), 100, 100), None);
+    }
+
+    #[test]
+    fn damage_margins() {
+        assert_eq!(damage_margin((1920, 1080), (1920, 1080)), 0);
+        assert_eq!(damage_margin((3840, 2160), (1920, 1080)), 2, "2× down");
+        assert_eq!(damage_margin((1920, 1080), (2880, 1620)), 1, "1.5× up");
+        assert_eq!(
+            damage_margin((1920, 1080), (1000, 1080)),
+            2,
+            "a texel per unit of downscale"
+        );
+        assert_eq!(damage_margin((1920, 1080), (0, 0)), 0, "not allocated yet");
+        assert_eq!(damage_margin((0, 0), (800, 600)), 0, "no picture");
     }
 }
