@@ -258,6 +258,10 @@ impl Paintable {
             }
 
             let buf_stride = max_w as usize * 4;
+            // The GL texture is RGBA, and GTK's Vulkan renderer takes it through a dmabuf of a
+            // format with alpha, ignoring the texture's "x": an XRGB source's X byte (0 from
+            // QEMU's firmware screen) would make the picture transparent.
+            let opaque = !self.pixel_format.get().has_alpha();
             let mut buffer = self.buffer.borrow_mut();
             for row in 0..h as usize {
                 let src_start = row * stride as usize;
@@ -265,7 +269,13 @@ impl Paintable {
                 let dst_start = (y as usize + row) * buf_stride + x as usize * 4;
                 let dst_end = dst_start + w as usize * 4;
                 if src_end <= data.len() && dst_end <= buffer.len() {
-                    buffer[dst_start..dst_end].copy_from_slice(&data[src_start..src_end]);
+                    let dst = &mut buffer[dst_start..dst_end];
+                    dst.copy_from_slice(&data[src_start..src_end]);
+                    if opaque {
+                        for px in dst.chunks_exact_mut(4) {
+                            px[3] = 0xff;
+                        }
+                    }
                 }
             }
             drop(buffer);
