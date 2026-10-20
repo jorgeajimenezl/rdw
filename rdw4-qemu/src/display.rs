@@ -324,8 +324,12 @@ mod imp {
                 #[cfg(unix)]
                 ConsoleFrame::Dmabuf(s) => match crate::external::dup_dmabuf(s) {
                     Ok(s) => {
-                        obj.set_display_size(Some((s.width as _, s.height as _)));
+                        let (w, h) = (s.width as i32, s.height as i32);
+                        obj.set_display_size(Some((w as _, h as _)));
+                        // A kept import copies nothing by itself: the texture holds the
+                        // external source's frame, so take the whole buffer.
                         obj.set_dmabuf_scanout(s);
+                        obj.update_area(0, 0, w, h, 0, None);
                     }
                     Err(e) => log::warn!("Failed to dup the console's DMABUF: {e}"),
                 },
