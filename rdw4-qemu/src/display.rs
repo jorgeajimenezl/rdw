@@ -1,4 +1,4 @@
-use crate::{audio, clipboard, cursor};
+use crate::{audio, clipboard, cursor, external::ConsoleFrame};
 use futures_util::StreamExt;
 use glib::{clone, subclass::prelude::*, MainContext};
 use gtk::glib;
@@ -74,6 +74,15 @@ mod imp {
         after_define: Cell<bool>,
         // the application supplies cursor images (see Display::set_external_cursor_images)
         pub(crate) external_cursor: Cell<bool>,
+        // the application shows another source (see Display::set_external_source)
+        pub(crate) external_source: Cell<bool>,
+        // the console's latest scanout, shown again when the source is back
+        pub(crate) console_frame: RefCell<ConsoleFrame>,
+        // the console's latest cursor image and MouseSet, for the same
+        console_cursor: RefCell<Option<gtk::gdk::Cursor>>,
+        console_mouse: Cell<Option<(i32, i32, bool)>>,
+        // the application sends absolute motion (see Display::set_external_abs_motion)
+        pub(crate) external_abs_motion: Cell<bool>,
     }
 
     #[glib::object_subclass]
@@ -124,6 +133,9 @@ mod imp {
                 move |_, x, y| {
                     log::trace!("motion: {:?}", (x, y));
                     this.host_pos.set(Some((x as _, y as _)));
+                    if this.external_abs_motion.get() {
+                        return;
+                    }
                     MainContext::default().spawn_local(clone!(
                         #[weak]
                         this,
@@ -258,7 +270,75 @@ mod imp {
             if self.cursor_hidden.replace(!visible) == visible {
                 log::debug!("guest cursor {}", if visible { "shown" } else { "hidden" });
             }
-            self.obj().set_cursor_visible(visible);
+            if !self.external_source.get() {
+                self.obj().set_cursor_visible(visible);
+            }
+        }
+
+        pub(crate) fn set_external_source(&self, external: bool) {
+            if self.external_source.replace(external) == external {
+                return;
+            }
+            log::debug!("external source {}", if external { "on" } else { "off" });
+            if external {
+                if let Some(id) = self.cursor_hide.take() {
+                    id.remove();
+                }
+            } else {
+                self.show_console();
+            }
+        }
+
+        /// Shows the console's latest scanout and cursor again.
+        fn show_console(&self) {
+            let obj = self.obj();
+            match &mut *self.console_frame.borrow_mut() {
+                ConsoleFrame::None => {}
+                ConsoleFrame::Memory {
+                    width,
+                    height,
+                    stride,
+                    data,
+                } => {
+                    obj.set_display_pixel_format(rdw::PixelFormat::Bgrx);
+                    obj.set_display_size(Some((*width as _, *height as _)));
+                    // Without the pixels (the scanout came before), the next updates repaint.
+                    if let Some(data) = data.take() {
+                        obj.update_area(0, 0, *width as _, *height as _, *stride as _, Some(&data));
+                    }
+                }
+                ConsoleFrame::Map { width, height } => {
+                    if let Some(map) = self.scanout_map.borrow().as_ref() {
+                        obj.set_display_pixel_format(rdw::PixelFormat::Bgrx);
+                        obj.set_display_size(Some((*width as _, *height as _)));
+                        obj.update_area(
+                            0,
+                            0,
+                            *width as _,
+                            *height as _,
+                            map.stride() as _,
+                            Some(map.as_ref()),
+                        );
+                    }
+                }
+                #[cfg(unix)]
+                ConsoleFrame::Dmabuf(s) => match crate::external::dup_dmabuf(s) {
+                    Ok(s) => {
+                        obj.set_display_size(Some((s.width as _, s.height as _)));
+                        obj.set_dmabuf_scanout(s);
+                    }
+                    Err(e) => log::warn!("Failed to dup the console's DMABUF: {e}"),
+                },
+            }
+            if !self.external_cursor.get() {
+                if let Some(cursor) = self.console_cursor.borrow().clone() {
+                    obj.define_cursor(Some(cursor));
+                }
+            }
+            if let Some((x, y, on)) = self.console_mouse.get() {
+                obj.set_cursor_position(on.then_some((x, y)));
+            }
+            obj.set_cursor_visible(!self.cursor_hidden.get());
         }
 
         fn update_cursor_visibility(&self, v: cursor::Visibility) {
@@ -330,6 +410,16 @@ mod imp {
                                             log::warn!("Format not yet supported: {:X}", s.format);
                                             continue;
                                         }
+                                        let external = this.external_source.get();
+                                        this.console_frame.replace(ConsoleFrame::Memory {
+                                            width: s.width,
+                                            height: s.height,
+                                            stride: s.stride,
+                                            data: external.then(|| s.data.clone()),
+                                        });
+                                        if external {
+                                            continue;
+                                        }
                                         this.obj().set_display_pixel_format(rdw::PixelFormat::Bgrx);
                                         this.obj()
                                             .set_display_size(Some((s.width as _, s.height as _)));
@@ -345,6 +435,13 @@ mod imp {
                                     Update(u) => {
                                         if u.format != XRGB_FORMAT {
                                             log::warn!("Format not yet supported: {:X}", u.format);
+                                            continue;
+                                        }
+                                        if this.external_source.get() {
+                                            this.console_frame.borrow_mut().apply_update(
+                                                u.x as _, u.y as _, u.w as _, u.h as _, u.stride,
+                                                &u.data,
+                                            );
                                             continue;
                                         }
                                         this.obj().update_area(
@@ -365,11 +462,18 @@ mod imp {
                                             );
                                             continue;
                                         }
-                                        this.obj().set_display_pixel_format(rdw::PixelFormat::Bgrx);
-                                        this.obj().set_display_size(Some((
-                                            scanout.width as _,
-                                            scanout.height as _,
-                                        )));
+                                        if !this.external_source.get() {
+                                            this.obj()
+                                                .set_display_pixel_format(rdw::PixelFormat::Bgrx);
+                                            this.obj().set_display_size(Some((
+                                                scanout.width as _,
+                                                scanout.height as _,
+                                            )));
+                                        }
+                                        this.console_frame.replace(ConsoleFrame::Map {
+                                            width: scanout.width,
+                                            height: scanout.height,
+                                        });
                                         let map = match scanout.mmap() {
                                             Ok(map) => Some(map),
                                             Err(err) => {
@@ -382,6 +486,9 @@ mod imp {
                                     }
                                     UpdateMap(u) => {
                                         log::debug!("{u:?}");
+                                        if this.external_source.get() {
+                                            continue;
+                                        }
                                         let scanout_map = this.scanout_map.borrow();
                                         let Some(map) = scanout_map.as_ref() else {
                                             log::warn!("No mapped scanout!");
@@ -429,9 +536,7 @@ mod imp {
                                     #[cfg(unix)]
                                     ScanoutDMABUF(s) => {
                                         log::trace!("{s:?}");
-                                        this.obj()
-                                            .set_display_size(Some((s.width as _, s.height as _)));
-                                        this.obj().set_dmabuf_scanout(rdw::RdwDmabufScanout {
+                                        let s = rdw::RdwDmabufScanout {
                                             width: s.width,
                                             height: s.height,
                                             offset: s.offset,
@@ -441,13 +546,32 @@ mod imp {
                                             y0_top: s.y0_top,
                                             modifier: s.modifier,
                                             fd: s.into_raw_fds(),
-                                        });
+                                        };
+                                        if this.external_source.get() {
+                                            this.console_frame.replace(ConsoleFrame::Dmabuf(s));
+                                            continue;
+                                        }
+                                        match crate::external::dup_dmabuf(&s) {
+                                            Ok(copy) => {
+                                                this.console_frame
+                                                    .replace(ConsoleFrame::Dmabuf(copy));
+                                            }
+                                            Err(e) => {
+                                                log::warn!("Failed to dup DMABUF: {e}");
+                                                this.console_frame.replace(ConsoleFrame::None);
+                                            }
+                                        }
+                                        this.obj()
+                                            .set_display_size(Some((s.width as _, s.height as _)));
+                                        this.obj().set_dmabuf_scanout(s);
                                     }
                                     #[cfg(unix)]
                                     UpdateDMABUF { wait_tx, update } => {
-                                        this.obj().update_area(
-                                            update.x, update.y, update.w, update.h, 0, None,
-                                        );
+                                        if !this.external_source.get() {
+                                            this.obj().update_area(
+                                                update.x, update.y, update.w, update.h, 0, None,
+                                            );
+                                        }
                                         let _ = wait_tx.send(());
                                     }
                                     Disable => {
@@ -460,6 +584,7 @@ mod imp {
                                         log::debug!("{c:?}");
                                         // With external images (an agent supplies them), QEMU's are not used:
                                         // they can be one shape late (viogpudo). The hot spot still is.
+                                        // While the source is external, it's kept for later.
                                         if !this.external_cursor.get() {
                                             let cursor = rdw::Display::make_cursor(
                                                 &cursor::argb_to_rgba(&c.data),
@@ -469,13 +594,21 @@ mod imp {
                                                 c.hot_y,
                                                 1,
                                             );
-                                            this.obj().define_cursor(Some(cursor));
+                                            this.console_cursor.replace(Some(cursor.clone()));
+                                            if !this.external_source.get() {
+                                                this.obj().define_cursor(Some(cursor));
+                                            }
                                         }
                                         this.cursor_hot.set((c.hot_x, c.hot_y));
                                         this.after_define.set(true);
                                     }
                                     MouseSet(m) => {
                                         log::trace!("{m:?}");
+                                        this.console_mouse.set(Some((m.x, m.y, m.on != 0)));
+                                        if this.external_source.get() {
+                                            this.after_define.set(false);
+                                            continue;
+                                        }
                                         if m.on != 0 {
                                             this.obj()
                                                 .set_cursor_position(Some((m.x as _, m.y as _)));
@@ -527,6 +660,31 @@ impl Display {
     /// whose own cursor images are unreliable, when an agent reports the real shape.
     pub fn set_external_cursor_images(&self, external: bool) {
         self.imp().external_cursor.set(external);
+    }
+
+    /// Show frames from another source than this console, fed through [`rdw::DisplayExt`]
+    /// (`set_display_size`, `update_area`, `copy_dmabuf_area`, the cursor calls). While it's on,
+    /// the console's scanouts, updates and cursor are recorded but not shown, and the display
+    /// keeps the size and frame the application gives it. Turning it off shows the console's
+    /// latest scanout and cursor again (a memory scanout from before the switch comes back with
+    /// its next updates). Input is untouched; see [`Self::set_external_abs_motion`].
+    pub fn set_external_source(&self, external: bool) {
+        self.imp().set_external_source(external);
+    }
+
+    pub fn external_source(&self) -> bool {
+        self.imp().external_source.get()
+    }
+
+    /// Don't send absolute pointer motion to the console (`SetAbsPosition`), because the
+    /// application sends it another way. The `motion` signal still fires, in display
+    /// coordinates. Keys, buttons, the wheel and relative motion still go to the console.
+    pub fn set_external_abs_motion(&self, external: bool) {
+        self.imp().external_abs_motion.set(external);
+    }
+
+    pub fn external_abs_motion(&self) -> bool {
+        self.imp().external_abs_motion.get()
     }
 
     /// Which host source the guest's microphone records from (the desktop's default until

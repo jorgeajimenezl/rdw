@@ -4,6 +4,7 @@ pub mod audio;
 pub mod clipboard;
 mod cursor;
 mod display;
+mod external;
 /// cbindgen:ignore
 #[cfg(unix)]
 mod usbredir;
