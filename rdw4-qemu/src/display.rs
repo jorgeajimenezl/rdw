@@ -78,9 +78,13 @@ mod imp {
         pub(crate) external_source: Cell<bool>,
         // the console's latest scanout, shown again when the source is back
         pub(crate) console_frame: RefCell<ConsoleFrame>,
-        // the console's latest cursor image and MouseSet, for the same
+        // the console's latest cursor image (QEMU's, or the application's with external
+        // images) and MouseSet, for the same
         console_cursor: RefCell<Option<gtk::gdk::Cursor>>,
         console_mouse: Cell<Option<(i32, i32, bool)>>,
+        // the external source's cursor image and visibility, shown while it is
+        source_cursor: RefCell<Option<gtk::gdk::Cursor>>,
+        source_cursor_hidden: Cell<bool>,
         // the application sends absolute motion (see Display::set_external_abs_motion)
         pub(crate) external_abs_motion: Cell<bool>,
     }
@@ -284,8 +288,32 @@ mod imp {
                 if let Some(id) = self.cursor_hide.take() {
                     id.remove();
                 }
+                let obj = self.obj();
+                obj.define_cursor(self.source_cursor.borrow().clone());
+                obj.set_cursor_visible(!self.source_cursor_hidden.get());
             } else {
                 self.show_console();
+            }
+        }
+
+        pub(crate) fn define_console_cursor(&self, cursor: Option<gtk::gdk::Cursor>) {
+            self.console_cursor.replace(cursor.clone());
+            if !self.external_source.get() {
+                self.obj().define_cursor(cursor);
+            }
+        }
+
+        pub(crate) fn define_source_cursor(&self, cursor: Option<gtk::gdk::Cursor>) {
+            self.source_cursor.replace(cursor.clone());
+            if self.external_source.get() {
+                self.obj().define_cursor(cursor);
+            }
+        }
+
+        pub(crate) fn set_source_cursor_visible(&self, visible: bool) {
+            self.source_cursor_hidden.set(!visible);
+            if self.external_source.get() {
+                self.obj().set_cursor_visible(visible);
             }
         }
 
@@ -331,10 +359,8 @@ mod imp {
                     Err(e) => log::warn!("Failed to dup the console's DMABUF: {e}"),
                 },
             }
-            if !self.external_cursor.get() {
-                if let Some(cursor) = self.console_cursor.borrow().clone() {
-                    obj.define_cursor(Some(cursor));
-                }
+            if let Some(cursor) = self.console_cursor.borrow().clone() {
+                obj.define_cursor(Some(cursor));
             }
             if let Some((x, y, on)) = self.console_mouse.get() {
                 obj.set_cursor_position(on.then_some((x, y)));
@@ -596,10 +622,7 @@ mod imp {
                                                 c.hot_y,
                                                 1,
                                             );
-                                            this.console_cursor.replace(Some(cursor.clone()));
-                                            if !this.external_source.get() {
-                                                this.obj().define_cursor(Some(cursor));
-                                            }
+                                            this.define_console_cursor(Some(cursor));
                                         }
                                         this.cursor_hot.set((c.hot_x, c.hot_y));
                                         this.after_define.set(true);
@@ -657,19 +680,39 @@ glib::wrapper! {
 }
 
 impl Display {
-    /// Take cursor images from the application ([`rdw::DisplayExt::define_cursor`]) instead of
+    /// Take cursor images from the application ([`Self::define_console_cursor`]) instead of
     /// QEMU's `CursorDefine`. QEMU's position, visibility and hot spot still apply. For guests
     /// whose own cursor images are unreliable, when an agent reports the real shape.
     pub fn set_external_cursor_images(&self, external: bool) {
         self.imp().external_cursor.set(external);
     }
 
+    /// The console's cursor image, from the application (with
+    /// [`Self::set_external_cursor_images`]). Kept, and shown while the console's picture is,
+    /// also after an external source.
+    pub fn define_console_cursor(&self, cursor: Option<gtk::gdk::Cursor>) {
+        self.imp().define_console_cursor(cursor);
+    }
+
+    /// The external source's cursor image ([`Self::set_external_source`]). Kept, and shown while
+    /// that source is, also after the console's picture.
+    pub fn define_source_cursor(&self, cursor: Option<gtk::gdk::Cursor>) {
+        self.imp().define_source_cursor(cursor);
+    }
+
+    /// Whether the external source's cursor shows (until told, it does); kept like its image.
+    pub fn set_source_cursor_visible(&self, visible: bool) {
+        self.imp().set_source_cursor_visible(visible);
+    }
+
     /// Show frames from another source than this console, fed through [`rdw::DisplayExt`]
-    /// (`set_display_size`, `update_area`, `copy_dmabuf_area`, the cursor calls). While it's on,
+    /// (`set_display_size`, `update_area`, `set_dmabuf_scanout`), with its own cursor
+    /// ([`Self::define_source_cursor`], [`Self::set_source_cursor_visible`]). While it's on,
     /// the console's scanouts, updates and cursor are recorded but not shown, and the display
-    /// keeps the size and frame the application gives it. Turning it off shows the console's
-    /// latest scanout and cursor again (a memory scanout from before the switch comes back with
-    /// its next updates). Input is untouched; see [`Self::set_external_abs_motion`].
+    /// keeps the size and frame the application gives it. Turning it on shows the source's
+    /// cursor as last defined; turning it off shows the console's latest scanout and cursor
+    /// again (a memory scanout from before the switch comes back with its next updates). Input
+    /// is untouched; see [`Self::set_external_abs_motion`].
     pub fn set_external_source(&self, external: bool) {
         self.imp().set_external_source(external);
     }
