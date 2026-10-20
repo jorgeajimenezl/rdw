@@ -73,6 +73,10 @@ struct Import {
 #[cfg(unix)]
 const KEPT_IMPORTS: usize = 4;
 
+/// GLES stores BGRA through EXT_texture_format_BGRA8888, in BGRA storage only.
+#[cfg(unix)]
+const BGRA_EXT: u32 = 0x80E1;
+
 #[derive(Debug, Default)]
 pub struct Paintable {
     buffer: RefCell<Vec<u8>>,
@@ -526,8 +530,6 @@ impl Paintable {
     /// the storage changes), and wraps the texture for GTK.
     #[cfg(unix)]
     fn upload_gl_area(&self, x: i32, y: i32, w: i32, h: i32) -> Result<(), glib::error::Error> {
-        // GLES (EXT_texture_format_BGRA8888) uploads BGRA only into BGRA storage.
-        const BGRA_EXT: u32 = 0x80E1;
         let ctxt = self.gl_context()?;
         let gles = ctxt.api() == gdk::GLAPI::GLES;
         ctxt.make_current();
@@ -540,21 +542,7 @@ impl Paintable {
         unsafe {
             gl::BindTexture(gl::TEXTURE_2D, self.texture_id()?);
             if full {
-                let internal = match (gles, format.as_opengl()) {
-                    (true, gl::BGRA) => BGRA_EXT,
-                    _ => gl::RGBA8,
-                };
-                gl::TexImage2D(
-                    gl::TEXTURE_2D,
-                    0,
-                    internal as _,
-                    max_w,
-                    max_h,
-                    0,
-                    format.as_opengl(),
-                    gl::UNSIGNED_BYTE,
-                    buffer.as_ptr() as _,
-                );
+                Self::alloc_storage(gles, storage, buffer.as_ptr() as _);
             } else {
                 gl::PixelStorei(gl::UNPACK_ROW_LENGTH, max_w);
                 gl::PixelStorei(gl::UNPACK_SKIP_PIXELS, x);
@@ -716,7 +704,6 @@ impl Paintable {
         &self,
         rect: Option<cairo::RectangleInt>,
     ) -> Result<(), glib::error::Error> {
-        const BGRA_EXT: u32 = 0x80E1;
         let err = |msg: String| glib::Error::new(crate::Error::GL, &msg);
         let dmabuf = self.dmabuf.borrow();
         let d = dmabuf
@@ -730,8 +717,7 @@ impl Paintable {
         let mut imports = self.imports.borrow_mut();
         let new = match imports.iter().position(|i| i.key == key) {
             Some(at) => {
-                let import = imports.remove(at);
-                imports.insert(0, import);
+                imports[..=at].rotate_right(1);
                 false
             }
             None => {
@@ -762,22 +748,8 @@ impl Paintable {
         let texture_id = self.texture_id()?;
         unsafe {
             if full {
-                let internal = match (gles, format.as_opengl()) {
-                    (true, gl::BGRA) => BGRA_EXT,
-                    _ => gl::RGBA8,
-                };
                 gl::BindTexture(gl::TEXTURE_2D, texture_id);
-                gl::TexImage2D(
-                    gl::TEXTURE_2D,
-                    0,
-                    internal as _,
-                    max_w,
-                    max_h,
-                    0,
-                    format.as_opengl(),
-                    gl::UNSIGNED_BYTE,
-                    std::ptr::null(),
-                );
+                Self::alloc_storage(gles, storage, std::ptr::null());
             }
             let mut fbos = [0; 2];
             gl::GenFramebuffers(2, fbos.as_mut_ptr());
@@ -861,6 +833,30 @@ impl Paintable {
         if let Err(e) = crate::egl::egl().destroy_image(import.display, import.image) {
             log::warn!("eglDestroyImage failed: {e}");
         }
+    }
+
+    /// (Re)allocates the bound texture's storage, filled from `data` (or left undefined).
+    #[cfg(unix)]
+    unsafe fn alloc_storage(
+        gles: bool,
+        (w, h, format): (i32, i32, PixelFormat),
+        data: *const std::ffi::c_void,
+    ) {
+        let internal = match (gles, format.as_opengl()) {
+            (true, gl::BGRA) => BGRA_EXT,
+            _ => gl::RGBA8,
+        };
+        gl::TexImage2D(
+            gl::TEXTURE_2D,
+            0,
+            internal as _,
+            w,
+            h,
+            0,
+            format.as_opengl(),
+            gl::UNSIGNED_BYTE,
+            data,
+        );
     }
 
     /// Deletes the syncs of released textures. Our GL context must be current.
