@@ -27,8 +27,8 @@ pixman-sys = "0.1.0"
 rdw = { package = "rdw4", path = "../rdw4", default-features = false }
 
 [dependencies.qemu-display]
-git = "https://gitlab.com/marcandre.lureau/qemu-display.git"
-rev = "cc31fac8500d00d1e02d7c83b3f5f3915176263f"
+git = "https://github.com/jorgeajimenezl/qemu-display"
+rev = "b7b8fc073ef4c1e508f88ac7419e8b0844b8bb7f"
 
 [target.'cfg(unix)'.dependencies]
 usbredirhost = "0.4"

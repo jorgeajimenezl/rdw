@@ -3444,7 +3444,7 @@ dependencies = [
 [[package]]
 name = "qemu-display"
 version = "0.2.1"
-source = "git+https://gitlab.com/marcandre.lureau/qemu-display.git?rev=cc31fac8500d00d1e02d7c83b3f5f3915176263f#cc31fac8500d00d1e02d7c83b3f5f3915176263f"
+source = "git+https://github.com/jorgeajimenezl/qemu-display?rev=b7b8fc073ef4c1e508f88ac7419e8b0844b8bb7f#b7b8fc073ef4c1e508f88ac7419e8b0844b8bb7f"
 dependencies = [
  "async-broadcast",
  "async-lock",

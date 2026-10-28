@@ -1,6 +1,6 @@
 use crate::{audio, clipboard, cursor, external::ConsoleFrame};
 use futures_util::StreamExt;
-use glib::{clone, subclass::prelude::*, MainContext};
+use glib::{clone, prelude::*, subclass::prelude::*, MainContext};
 use gtk::glib;
 #[cfg(windows)]
 use qemu_display::ConsoleListenerD3d11Handler;
@@ -99,6 +99,15 @@ mod imp {
     }
 
     impl ObjectImpl for Display {
+        fn signals() -> &'static [glib::subclass::Signal] {
+            static SIGNALS: OnceLock<Vec<glib::subclass::Signal>> = OnceLock::new();
+            SIGNALS.get_or_init(|| {
+                vec![glib::subclass::Signal::builder("listener-failed")
+                    .param_types([String::static_type()])
+                    .build()]
+            })
+        }
+
         fn constructed(&self) {
             self.parent_constructed();
 
@@ -414,16 +423,25 @@ mod imp {
                     // we have to use a channel, because widget is not Send..
                     let (sender, mut receiver) = futures::channel::mpsc::unbounded();
                     let handler = ConsoleHandler { sender };
-                    console.register_listener(handler.clone()).await.unwrap();
-                    #[cfg(any(windows, unix))]
-                    console.set_map_listener(handler.clone()).await.unwrap();
-                    #[cfg(windows)]
-                    console.set_d3d11_listener(handler.clone()).await.unwrap();
-                    #[cfg(unix)]
-                    console
-                        .set_scanout_dmabuf2_listener(handler.clone())
-                        .await
-                        .unwrap();
+                    let registered: Result<(), qemu_display::Error> = async {
+                        console.register_listener(handler.clone()).await?;
+                        #[cfg(any(windows, unix))]
+                        console.set_map_listener(handler.clone()).await?;
+                        #[cfg(windows)]
+                        console.set_d3d11_listener(handler.clone()).await?;
+                        #[cfg(unix)]
+                        console
+                            .set_scanout_dmabuf2_listener(handler.clone())
+                            .await?;
+                        Ok(())
+                    }
+                    .await;
+                    if let Err(e) = registered {
+                        log::warn!("Failed to register the console listener: {e}");
+                        this.obj()
+                            .emit_by_name::<()>("listener-failed", &[&e.to_string()]);
+                        return;
+                    }
 
                     MainContext::default().spawn_local(clone!(
                         #[weak]
@@ -779,6 +797,19 @@ impl Display {
     where
         C: FnOnce(Result<(), qemu_display::Error>) + 'static,
     {
+        Self::new_with_socket_pair(q_display, on_disconnected, None).await
+    }
+
+    /// [`Self::new_with_qemu_display`], with `socket_pair` making the listeners' socketpairs
+    /// (see [`qemu_display::util::SocketPairFn`]).
+    pub async fn new_with_socket_pair<C>(
+        q_display: &qemu_display::Display<'static>,
+        on_disconnected: Option<C>,
+        socket_pair: Option<qemu_display::util::SocketPairFn>,
+    ) -> Result<Self, qemu_display::Error>
+    where
+        C: FnOnce(Result<(), qemu_display::Error>) + 'static,
+    {
         if let Some(on_disconnected) = on_disconnected {
             glib::spawn_future_local(glib::clone!(
                 #[strong]
@@ -799,17 +830,19 @@ impl Display {
             ));
         }
 
-        let console = Console::new(
+        let mut console = Console::new(
             q_display.connection(),
             0,
             #[cfg(windows)]
             q_display.peer_pid(),
         )
         .await?;
+        console.set_socket_pair(socket_pair.clone());
 
         let slf = Display::new_for_console(console);
 
-        let audio_handler = if let Ok(Some(audio)) = q_display.audio().await {
+        let audio_handler = if let Ok(Some(mut audio)) = q_display.audio().await {
+            audio.set_socket_pair(socket_pair);
             audio::Handler::new(audio, slf.imp().audio_input.clone())
                 .await
                 .inspect_err(|e| log::warn!("Failed to setup audio handler: {}", e))
@@ -843,6 +876,19 @@ impl Display {
         let self_ = imp::Display::from_obj(&obj);
         self_.console.set(console).unwrap();
         obj
+    }
+
+    /// A listener on the console failed to register: the display shows nothing. The argument
+    /// is the error.
+    pub fn connect_listener_failed<F: Fn(&Self, &str) + 'static>(
+        &self,
+        f: F,
+    ) -> glib::SignalHandlerId {
+        self.connect_closure(
+            "listener-failed",
+            false,
+            glib::closure_local!(move |obj: &Self, msg: &str| f(obj, msg)),
+        )
     }
 
     pub(crate) fn console(&self) -> &Console {
