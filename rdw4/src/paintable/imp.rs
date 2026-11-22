@@ -267,7 +267,8 @@ impl Paintable {
     }
 
     pub(crate) fn set_white_scale(&self, scale: f32) {
-        let scale = (scale != 1.0).then_some(scale);
+        // Near 1 is invisible, and any matrix costs GTK's Vulkan renderer a copy per frame.
+        let scale = ((scale - 1.0).abs() > 0.02).then_some(scale);
         if self.white_scale.replace(scale) != scale {
             self.obj().invalidate_contents();
         }

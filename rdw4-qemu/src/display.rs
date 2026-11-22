@@ -329,6 +329,9 @@ mod imp {
         /// Shows the console's latest scanout and cursor again.
         fn show_console(&self) {
             let obj = self.obj();
+            // The external source's presentation isn't the console's.
+            obj.set_display_color_state(&gtk::gdk::ColorState::srgb());
+            obj.set_display_white_scale(1.0);
             match &mut *self.console_frame.borrow_mut() {
                 ConsoleFrame::None => {}
                 ConsoleFrame::Memory {
