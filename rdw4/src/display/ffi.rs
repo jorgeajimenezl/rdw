@@ -22,6 +22,15 @@ extern "C" {
 
     pub fn rdw_display_set_display_pixel_format(dpy: *mut RdwDisplay, format: RdwPixelFormat);
 
+    pub fn rdw_display_get_display_color_state(
+        dpy: *mut RdwDisplay,
+    ) -> *mut gdk::ffi::GdkColorState;
+
+    pub fn rdw_display_set_display_color_state(
+        dpy: *mut RdwDisplay,
+        state: *mut gdk::ffi::GdkColorState,
+    );
+
     pub fn rdw_display_define_cursor(dpy: *mut RdwDisplay, cursor: *const gdk::ffi::GdkCursor);
 
     pub fn rdw_display_set_cursor_position(dpy: *mut RdwDisplay, enabled: bool, x: i32, y: i32);

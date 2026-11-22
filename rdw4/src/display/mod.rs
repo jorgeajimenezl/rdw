@@ -99,6 +99,11 @@ pub trait DisplayExt: 'static {
 
     fn set_display_pixel_format(&self, format: PixelFormat);
 
+    /// The colour state of the frames: sRGB unless set.
+    fn display_color_state(&self) -> gdk::ColorState;
+
+    fn set_display_color_state(&self, state: &gdk::ColorState);
+
     fn define_cursor(&self, cursor: Option<gdk::Cursor>);
 
     fn mouse_absolute(&self) -> bool;
@@ -298,6 +303,39 @@ impl<O: IsA<Display> + IsA<gtk::Widget> + IsA<gtk::Accessible>> DisplayExt for O
             }
 
             self.queue_resize();
+        }
+    }
+
+    fn display_color_state(&self) -> gdk::ColorState {
+        // Safety: safe because IsA<Display>
+        let self_: &Display = unsafe { self.unsafe_cast_ref::<Display>() };
+
+        #[cfg(feature = "bindings")]
+        unsafe {
+            from_glib_none(ffi::rdw_display_get_display_color_state(
+                self_.to_glib_none().0,
+            ))
+        }
+        #[cfg(not(feature = "bindings"))]
+        {
+            self_.imp().picture.paintable().color_state()
+        }
+    }
+
+    fn set_display_color_state(&self, state: &gdk::ColorState) {
+        // Safety: safe because IsA<Display>
+        let self_: &Display = unsafe { self.unsafe_cast_ref::<Display>() };
+
+        #[cfg(feature = "bindings")]
+        unsafe {
+            ffi::rdw_display_set_display_color_state(
+                self_.to_glib_none().0,
+                state.to_glib_none().0,
+            );
+        }
+        #[cfg(not(feature = "bindings"))]
+        {
+            self_.imp().picture.paintable().set_color_state(state);
         }
     }
 

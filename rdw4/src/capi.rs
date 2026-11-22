@@ -135,6 +135,35 @@ pub extern "C" fn rdw_display_set_display_pixel_format(
     this.set_display_pixel_format(unsafe { crate::enums::PixelFormat::from_glib(format) });
 }
 
+/// rdw_display_get_display_color_state:
+/// @dpy: A #RdwDisplay
+///
+/// Returns: (transfer none): the colour state of the display's frames
+#[no_mangle]
+pub extern "C" fn rdw_display_get_display_color_state(
+    dpy: *mut RdwDisplay,
+) -> *mut gdk::ffi::GdkColorState {
+    let this: &Display = unsafe { &from_glib_borrow(dpy) };
+    let state = this.display_color_state();
+    // The paintable holds a reference.
+    state.to_glib_none().0
+}
+
+/// rdw_display_set_display_color_state:
+/// @dpy: A #RdwDisplay
+/// @state: a #GdkColorState
+///
+/// Set the colour state of the display's frames (sRGB by default).
+#[no_mangle]
+pub extern "C" fn rdw_display_set_display_color_state(
+    dpy: *mut RdwDisplay,
+    state: *mut gdk::ffi::GdkColorState,
+) {
+    let this: &Display = unsafe { &from_glib_borrow(dpy) };
+    let state: gdk::ColorState = unsafe { from_glib_none(state) };
+    this.set_display_color_state(&state);
+}
+
 /// rdw_display_define_cursor:
 /// @dpy: A #RdwDisplay
 /// @cursor: (nullable): a #GdkCursor

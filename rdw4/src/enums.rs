@@ -220,14 +220,32 @@ pub enum PixelFormat {
     Bgra,
     Rgba,
     Bgrx,
+    /// Four 16-bit floats, R first (DRM `ABGR16161616F`).
+    Rgba16f,
     __Unknown(i32),
 }
 
 impl PixelFormat {
     pub fn as_opengl(self) -> u32 {
         match self {
-            PixelFormat::Rgba => gl::RGBA,
+            PixelFormat::Rgba | PixelFormat::Rgba16f => gl::RGBA,
             PixelFormat::Bgra | PixelFormat::Bgrx | _ => gl::BGRA,
+        }
+    }
+
+    /// The GL type of a component.
+    pub fn gl_type(self) -> u32 {
+        match self {
+            PixelFormat::Rgba16f => gl::HALF_FLOAT,
+            _ => gl::UNSIGNED_BYTE,
+        }
+    }
+
+    /// Bytes per pixel.
+    pub fn bpp(self) -> usize {
+        match self {
+            PixelFormat::Rgba16f => 8,
+            _ => 4,
         }
     }
 
@@ -244,6 +262,7 @@ impl IntoGlib for PixelFormat {
             PixelFormat::Bgra => ffi::RDW_PIXEL_FORMAT_BGRA,
             PixelFormat::Rgba => ffi::RDW_PIXEL_FORMAT_RGBA,
             PixelFormat::Bgrx => ffi::RDW_PIXEL_FORMAT_BGRX,
+            PixelFormat::Rgba16f => ffi::RDW_PIXEL_FORMAT_RGBA16F,
             PixelFormat::__Unknown(v) => v,
         }
     }
@@ -255,6 +274,7 @@ impl FromGlib<ffi::RdwPixelFormat> for PixelFormat {
             ffi::RDW_PIXEL_FORMAT_BGRA => Self::Bgra,
             ffi::RDW_PIXEL_FORMAT_RGBA => Self::Rgba,
             ffi::RDW_PIXEL_FORMAT_BGRX => Self::Bgrx,
+            ffi::RDW_PIXEL_FORMAT_RGBA16F => Self::Rgba16f,
             value => Self::__Unknown(value),
         }
     }

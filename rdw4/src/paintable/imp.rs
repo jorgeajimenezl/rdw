@@ -74,7 +74,6 @@ struct Import {
 const KEPT_IMPORTS: usize = 4;
 
 /// GLES stores BGRA through EXT_texture_format_BGRA8888, in BGRA storage only.
-#[cfg(unix)]
 const BGRA_EXT: u32 = 0x80E1;
 
 #[derive(Debug, Default)]
@@ -83,6 +82,8 @@ pub struct Paintable {
     width: Cell<i32>,
     height: Cell<i32>,
     pixel_format: Cell<PixelFormat>,
+    /// `None` is sRGB.
+    color_state: RefCell<Option<gdk::ColorState>>,
     texture: RefCell<Option<gdk::Texture>>,
     y0_top: Cell<Option<bool>>,
     /// The size it's drawn at, in device pixels, for the damage margin.
@@ -206,6 +207,7 @@ impl Paintable {
             PixelFormat::Bgra => gdk::MemoryFormat::B8g8r8a8Premultiplied,
             PixelFormat::Rgba => gdk::MemoryFormat::R8g8b8a8Premultiplied,
             PixelFormat::Bgrx => gdk::MemoryFormat::B8g8r8x8,
+            PixelFormat::Rgba16f => gdk::MemoryFormat::R16g16b16a16FloatPremultiplied,
             other => {
                 log::warn!("Unrecognized pixel format {other:?}, falling back to B8G8R8A8");
                 gdk::MemoryFormat::B8g8r8a8Premultiplied
@@ -218,6 +220,13 @@ impl Paintable {
             return Ok(());
         }
         self.pixel_format.set(format);
+        // The previous texture is of another format.
+        self.texture.replace(None);
+        let (w, h) = self.size();
+        let mut buffer = self.buffer.borrow_mut();
+        buffer.clear();
+        buffer.resize(w as usize * h as usize * format.bpp(), 0);
+        drop(buffer);
 
         #[cfg(windows)]
         {
@@ -230,6 +239,24 @@ impl Paintable {
         Ok(())
     }
 
+    pub(crate) fn color_state(&self) -> gdk::ColorState {
+        self.color_state
+            .borrow()
+            .clone()
+            .unwrap_or_else(gdk::ColorState::srgb)
+    }
+
+    pub(crate) fn set_color_state(&self, state: &gdk::ColorState) {
+        if self.color_state() == *state {
+            return;
+        }
+        self.color_state.replace(Some(state.clone()));
+        // An update can't change a texture's colour state: the next frame is whole.
+        self.texture.replace(None);
+        #[cfg(unix)]
+        self.gl_storage.set(None);
+    }
+
     pub(crate) fn set_size(&self, w: usize, h: usize) -> Result<(), glib::error::Error> {
         if self.size() == (w as _, h as _) {
             return Ok(());
@@ -237,9 +264,10 @@ impl Paintable {
         let (w, h) = (w as i32, h as i32);
         self.width.set(w);
         self.height.set(h);
-        self.buffer
-            .borrow_mut()
-            .resize((w as usize) * (h as usize) * 4, 0);
+        self.buffer.borrow_mut().resize(
+            (w as usize) * (h as usize) * self.pixel_format.get().bpp(),
+            0,
+        );
         self.texture.replace(None);
 
         #[cfg(windows)]
@@ -278,7 +306,8 @@ impl Paintable {
                 self.drop_imports();
             }
 
-            let buf_stride = max_w as usize * 4;
+            let bpp = self.pixel_format.get().bpp();
+            let buf_stride = max_w as usize * bpp;
             // The GL texture is RGBA, and GTK's Vulkan renderer takes it through a dmabuf of a
             // format with alpha, ignoring the texture's "x": an XRGB source's X byte (0 from
             // QEMU's firmware screen) would make the picture transparent.
@@ -286,9 +315,9 @@ impl Paintable {
             let mut buffer = self.buffer.borrow_mut();
             for row in 0..h as usize {
                 let src_start = row * stride as usize;
-                let src_end = src_start + w as usize * 4;
-                let dst_start = (y as usize + row) * buf_stride + x as usize * 4;
-                let dst_end = dst_start + w as usize * 4;
+                let src_end = src_start + w as usize * bpp;
+                let dst_start = (y as usize + row) * buf_stride + x as usize * bpp;
+                let dst_end = dst_start + w as usize * bpp;
                 if src_end <= data.len() && dst_end <= buffer.len() {
                     let dst = &mut buffer[dst_start..dst_end];
                     dst.copy_from_slice(&data[src_start..src_end]);
@@ -323,6 +352,7 @@ impl Paintable {
                 .set_width(max_w)
                 .set_height(max_h)
                 .set_stride(buf_stride)
+                .set_color_state(&self.color_state())
                 .set_update_texture(self.texture.borrow().as_ref())
                 .set_update_region(Some(&region))
                 .build();
@@ -452,7 +482,8 @@ impl Paintable {
             .set_modifier(d.modifier)
             .set_width(d.width)
             .set_height(d.height)
-            .set_n_planes(d.fds.len() as u32);
+            .set_n_planes(d.fds.len() as u32)
+            .set_color_state(Some(&self.color_state()));
 
         for (plane, &fd) in dup_fds.iter().enumerate() {
             builder = builder.set_fd(plane as u32, fd);
@@ -586,7 +617,7 @@ impl Paintable {
                     w,
                     h,
                     format.as_opengl(),
-                    gl::UNSIGNED_BYTE,
+                    format.gl_type(),
                     buffer.as_ptr() as _,
                 );
                 gl::PixelStorei(gl::UNPACK_ROW_LENGTH, 0);
@@ -873,19 +904,15 @@ impl Paintable {
         (w, h, format): (i32, i32, PixelFormat),
         data: *const std::ffi::c_void,
     ) {
-        let internal = match (gles, format.as_opengl()) {
-            (true, gl::BGRA) => BGRA_EXT,
-            _ => gl::RGBA8,
-        };
         gl::TexImage2D(
             gl::TEXTURE_2D,
             0,
-            internal as _,
+            gl_internal_format(gles, format) as _,
             w,
             h,
             0,
             format.as_opengl(),
-            gl::UNSIGNED_BYTE,
+            format.gl_type(),
             data,
         );
     }
@@ -904,6 +931,7 @@ impl Paintable {
         region: Option<&cairo::Region>,
     ) -> Result<(), glib::error::Error> {
         let ctxt = self.gl_context()?;
+        let gles = ctxt.api() == gdk::GLAPI::GLES;
         ctxt.make_current();
         #[cfg(unix)]
         self.delete_released_syncs();
@@ -916,11 +944,8 @@ impl Paintable {
                 .set_id(self.texture_id()?)
                 .set_width(w)
                 .set_height(h)
-                .set_format(if self.pixel_format.get().has_alpha() {
-                    gdk::MemoryFormat::R8g8b8a8
-                } else {
-                    gdk::MemoryFormat::R8g8b8x8
-                })
+                .set_format(gl_memory_format(gles, self.pixel_format.get()))
+                .set_color_state(&self.color_state())
                 .set_update_region(region)
                 .set_update_texture(self.texture.take().as_ref());
             let builder = if sync.is_null() {
@@ -947,6 +972,27 @@ impl Paintable {
         }
 
         Ok(())
+    }
+}
+
+/// The internal format of the texture's storage for `format`.
+fn gl_internal_format(gles: bool, format: PixelFormat) -> u32 {
+    match (gles, format) {
+        (_, PixelFormat::Rgba16f) => gl::RGBA16F,
+        (true, f) if f.as_opengl() == gl::BGRA => BGRA_EXT,
+        _ => gl::RGBA8,
+    }
+}
+
+/// What GTK is told the texture's storage holds.
+fn gl_memory_format(gles: bool, format: PixelFormat) -> gdk::MemoryFormat {
+    use gdk::MemoryFormat as M;
+    match (gl_internal_format(gles, format), format.has_alpha()) {
+        (gl::RGBA16F, _) => M::R16g16b16a16Float,
+        (BGRA_EXT, true) => M::B8g8r8a8,
+        (BGRA_EXT, false) => M::B8g8r8x8,
+        (_, true) => M::R8g8b8a8,
+        (_, false) => M::R8g8b8x8,
     }
 }
 
@@ -999,6 +1045,31 @@ mod tests {
         assert_eq!(clamp_rect(&rect(0, 0, 0, 10), 100, 100), None);
         assert_eq!(clamp_rect(&rect(0, 0, -10, 10), 100, 100), None);
         assert_eq!(clamp_rect(&rect(i32::MAX, 0, i32::MAX, 1), 100, 100), None);
+    }
+
+    #[test]
+    fn formats() {
+        assert_eq!(PixelFormat::Bgrx.bpp(), 4);
+        assert_eq!(PixelFormat::Rgba16f.bpp(), 8);
+        assert_eq!(PixelFormat::Rgba16f.gl_type(), gl::HALF_FLOAT);
+        assert_eq!(PixelFormat::Bgra.gl_type(), gl::UNSIGNED_BYTE);
+        for gles in [false, true] {
+            assert_eq!(gl_internal_format(gles, PixelFormat::Rgba16f), gl::RGBA16F);
+            assert_eq!(
+                gl_memory_format(gles, PixelFormat::Rgba16f),
+                gdk::MemoryFormat::R16g16b16a16Float
+            );
+            assert_eq!(gl_internal_format(gles, PixelFormat::Rgba), gl::RGBA8);
+        }
+        assert_eq!(gl_internal_format(true, PixelFormat::Bgrx), BGRA_EXT);
+        assert_eq!(
+            gl_memory_format(true, PixelFormat::Bgrx),
+            gdk::MemoryFormat::B8g8r8x8
+        );
+        assert_eq!(
+            gl_memory_format(false, PixelFormat::Bgra),
+            gdk::MemoryFormat::R8g8b8a8
+        );
     }
 
     #[test]

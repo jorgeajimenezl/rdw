@@ -27,6 +27,15 @@ impl Paintable {
         self.imp().pixel_format()
     }
 
+    /// The colour state of the frames, sRGB by default. A change makes the next frame whole.
+    pub fn set_color_state(&self, state: &gdk::ColorState) {
+        self.imp().set_color_state(state)
+    }
+
+    pub fn color_state(&self) -> gdk::ColorState {
+        self.imp().color_state()
+    }
+
     pub fn set_size(&self, w: usize, h: usize) -> Result<(), glib::error::Error> {
         self.imp().set_size(w, h)
     }
