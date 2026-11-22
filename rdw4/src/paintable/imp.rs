@@ -81,6 +81,8 @@ pub struct Paintable {
     pixel_format: Cell<PixelFormat>,
     /// `None` is sRGB.
     color_state: RefCell<Option<gdk::ColorState>>,
+    /// Factor on the frames' linear light; `None` is 1.
+    white_scale: Cell<Option<f32>>,
     texture: RefCell<Option<gdk::Texture>>,
     y0_top: Cell<Option<bool>>,
     /// The size it's drawn at, in device pixels, for the damage margin.
@@ -151,6 +153,23 @@ impl PaintableImpl for Paintable {
 
     fn snapshot(&self, snapshot: &gdk::Snapshot, width: f64, height: f64) {
         if let Some(texture) = self.texture.borrow().as_ref() {
+            let scale = self.white_scale.get();
+            if let Some(s) = scale {
+                // GTK applies a colour matrix to sRGB-encoded values (extended past 1), where
+                // scaling linear light by s is v·m + 0.055·(m − 1) with m = s^(1/2.4): exact
+                // above sRGB's linear toe, within 2.5/255 below it.
+                let m = s.powf(1.0 / 2.4);
+                let b = 0.055 * (m - 1.0);
+                snapshot.push_color_matrix(
+                    &graphene::Matrix::from_float([
+                        m, 0.0, 0.0, 0.0, //
+                        0.0, m, 0.0, 0.0, //
+                        0.0, 0.0, m, 0.0, //
+                        0.0, 0.0, 0.0, 1.0,
+                    ]),
+                    &graphene::Vec4::new(b, b, b, 0.0),
+                );
+            }
             let flip = self.y0_top.get().unwrap_or_default();
             if flip {
                 snapshot.save();
@@ -166,6 +185,9 @@ impl PaintableImpl for Paintable {
                     texture,
                     &graphene::Rect::new(0.0, 0.0, width as _, height as _),
                 );
+            }
+            if scale.is_some() {
+                snapshot.pop();
             }
         }
     }
@@ -238,6 +260,17 @@ impl Paintable {
         self.texture.replace(None);
         #[cfg(unix)]
         self.gl_storage.set(None);
+    }
+
+    pub(crate) fn white_scale(&self) -> f32 {
+        self.white_scale.get().unwrap_or(1.0)
+    }
+
+    pub(crate) fn set_white_scale(&self, scale: f32) {
+        let scale = (scale != 1.0).then_some(scale);
+        if self.white_scale.replace(scale) != scale {
+            self.obj().invalidate_contents();
+        }
     }
 
     /// Sizes the frame buffer for the size and format, keeping what fits.

@@ -104,6 +104,11 @@ pub trait DisplayExt: 'static {
 
     fn set_display_color_state(&self, state: &gdk::ColorState);
 
+    /// A factor on the frames' linear light: 1 unless set (see `Paintable::set_white_scale`).
+    fn display_white_scale(&self) -> f32;
+
+    fn set_display_white_scale(&self, scale: f32);
+
     fn define_cursor(&self, cursor: Option<gdk::Cursor>);
 
     fn mouse_absolute(&self) -> bool;
@@ -336,6 +341,34 @@ impl<O: IsA<Display> + IsA<gtk::Widget> + IsA<gtk::Accessible>> DisplayExt for O
         #[cfg(not(feature = "bindings"))]
         {
             self_.imp().picture.paintable().set_color_state(state);
+        }
+    }
+
+    fn display_white_scale(&self) -> f32 {
+        // Safety: safe because IsA<Display>
+        let self_: &Display = unsafe { self.unsafe_cast_ref::<Display>() };
+
+        #[cfg(feature = "bindings")]
+        unsafe {
+            ffi::rdw_display_get_display_white_scale(self_.to_glib_none().0)
+        }
+        #[cfg(not(feature = "bindings"))]
+        {
+            self_.imp().picture.paintable().white_scale()
+        }
+    }
+
+    fn set_display_white_scale(&self, scale: f32) {
+        // Safety: safe because IsA<Display>
+        let self_: &Display = unsafe { self.unsafe_cast_ref::<Display>() };
+
+        #[cfg(feature = "bindings")]
+        unsafe {
+            ffi::rdw_display_set_display_white_scale(self_.to_glib_none().0, scale);
+        }
+        #[cfg(not(feature = "bindings"))]
+        {
+            self_.imp().picture.paintable().set_white_scale(scale);
         }
     }
 

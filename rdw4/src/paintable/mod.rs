@@ -38,6 +38,17 @@ impl Paintable {
         self.imp().color_state()
     }
 
+    /// A factor on the frames' linear light, 1 by default: for an HDR source whose SDR white
+    /// isn't GTK's (scRGB puts Windows' at its nits / 80), so that it matches the host's. Not
+    /// free: GTK copies each new frame to apply it, which costs Vulkan a fresh image per frame.
+    pub fn set_white_scale(&self, scale: f32) {
+        self.imp().set_white_scale(scale)
+    }
+
+    pub fn white_scale(&self) -> f32 {
+        self.imp().white_scale()
+    }
+
     pub fn set_size(&self, w: usize, h: usize) -> Result<(), glib::error::Error> {
         self.imp().set_size(w, h)
     }

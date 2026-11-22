@@ -164,6 +164,28 @@ pub extern "C" fn rdw_display_set_display_color_state(
     this.set_display_color_state(&state);
 }
 
+/// rdw_display_get_display_white_scale:
+/// @dpy: A #RdwDisplay
+///
+/// Returns: the factor on the frames' linear light
+#[no_mangle]
+pub extern "C" fn rdw_display_get_display_white_scale(dpy: *mut RdwDisplay) -> f32 {
+    let this: &Display = unsafe { &from_glib_borrow(dpy) };
+    this.display_white_scale()
+}
+
+/// rdw_display_set_display_white_scale:
+/// @dpy: A #RdwDisplay
+/// @scale: the factor
+///
+/// Set a factor on the frames' linear light (1 by default), so that an HDR source's SDR white
+/// matches the host's.
+#[no_mangle]
+pub extern "C" fn rdw_display_set_display_white_scale(dpy: *mut RdwDisplay, scale: f32) {
+    let this: &Display = unsafe { &from_glib_borrow(dpy) };
+    this.set_display_white_scale(scale);
+}
+
 /// rdw_display_define_cursor:
 /// @dpy: A #RdwDisplay
 /// @cursor: (nullable): a #GdkCursor

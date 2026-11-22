@@ -31,6 +31,10 @@ extern "C" {
         state: *mut gdk::ffi::GdkColorState,
     );
 
+    pub fn rdw_display_get_display_white_scale(dpy: *mut RdwDisplay) -> f32;
+
+    pub fn rdw_display_set_display_white_scale(dpy: *mut RdwDisplay, scale: f32);
+
     pub fn rdw_display_define_cursor(dpy: *mut RdwDisplay, cursor: *const gdk::ffi::GdkCursor);
 
     pub fn rdw_display_set_cursor_position(dpy: *mut RdwDisplay, enabled: bool, x: i32, y: i32);

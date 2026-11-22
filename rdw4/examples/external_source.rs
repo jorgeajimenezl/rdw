@@ -6,12 +6,15 @@
 //!
 //! ```text
 //! cargo run --release -p rdw4 --example external_source -- [--dmabuf] [--full] [--check]
-//!     [--fp16] [--size WxH] [--seconds N]
+//!     [--fp16 [--white-scale S]] [--size WxH] [--seconds N]
 //! ```
 //!
 //! - `--dmabuf`: hand rdw each slot's DMABUF (default: the damaged pixels).
 //! - `--fp16`: FP16 slots in linear sRGB (`ABGR16161616F`, `srgb-linear`), the square at 4.0
 //!   (above SDR white); at 1.0 under `--check`, so the read-back compares exactly.
+//! - `--white-scale S`: with `--fp16`, the display scales linear light by S and the slots hold
+//!   everything at 1/S, so under `--check` the read-back still matches (S < 1 puts the pixels
+//!   above 1.0, as an HDR guest's desktop is).
 //! - `--full`: repaint the whole frame each tick (default: a moving 100 px square).
 //! - `--check`: every 30 frames, render the display offscreen and compare the square's centre
 //!   with what was written, and a background pixel within 1 per channel (a frame read in the
@@ -59,6 +62,7 @@ struct Options {
     full: bool,
     check: bool,
     fp16: bool,
+    white_scale: f32,
     width: i32,
     height: i32,
     seconds: Option<u64>,
@@ -70,6 +74,7 @@ fn parse_options() -> Options {
         full: false,
         check: false,
         fp16: false,
+        white_scale: 1.0,
         width: 1920,
         height: 1080,
         seconds: None,
@@ -82,6 +87,9 @@ fn parse_options() -> Options {
             "--full" => o.full = true,
             "--check" => o.check = true,
             "--fp16" => o.fp16 = true,
+            "--white-scale" => {
+                o.white_scale = args.next().expect("--white-scale S").parse().unwrap()
+            }
             "--size" => {
                 let v = args.next().expect("--size WxH");
                 let (w, h) = v.split_once('x').expect("--size WxH");
@@ -409,6 +417,7 @@ fn activate(app: &gtk::Application, o: Options) {
     display.set_display_pixel_format(o.format());
     if o.fp16 {
         display.set_display_color_state(&gdk::ColorState::srgb_linear());
+        display.set_display_white_scale(o.white_scale);
     }
     display.set_display_size(Some((o.width as usize, o.height as usize)));
     let window = gtk::ApplicationWindow::builder()
@@ -421,7 +430,8 @@ fn activate(app: &gtk::Application, o: Options) {
     window.present();
 
     let slots = Slots::new(o.width, o.height, o.format().bpp());
-    let gain = if o.check { 1.0 } else { FP16_GAIN };
+    let undo = 1.0 / o.white_scale;
+    let gain = undo * if o.check { 1.0 } else { FP16_GAIN };
     let dmabufs = if o.dmabuf {
         slot_dmabufs(&slots)
     } else {
@@ -432,7 +442,7 @@ fn activate(app: &gtk::Application, o: Options) {
         slots,
         dmabufs,
         frame: 0,
-        background: o.pixel(BACKGROUND, 1.0),
+        background: o.pixel(BACKGROUND, undo),
         square_pixels: COLOURS.iter().map(|&c| o.pixel(c, gain)).collect(),
         square_in: [None; SLOTS],
         shown: None,
@@ -497,7 +507,9 @@ fn activate(app: &gtk::Application, o: Options) {
                 }
             };
             // `&`, not `&&`: both report.
-            let ok = check(x, y, expected, 0) & (s.o.full || check(4, 4, BACKGROUND, 1));
+            // A scale rounds through half floats.
+            let slack = u8::from(s.o.white_scale != 1.0);
+            let ok = check(x, y, expected, slack) & (s.o.full || check(4, 4, BACKGROUND, 1));
             checks.set((n + 1, stale + u32::from(!ok)));
         }
         s.frame += 1;
