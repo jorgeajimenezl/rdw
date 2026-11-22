@@ -6,13 +6,17 @@
 //!
 //! ```text
 //! cargo run --release -p rdw4 --example external_source -- [--dmabuf] [--full] [--check]
-//!     [--size WxH] [--seconds N]
+//!     [--fp16] [--size WxH] [--seconds N]
 //! ```
 //!
 //! - `--dmabuf`: hand rdw each slot's DMABUF (default: the damaged pixels).
+//! - `--fp16`: FP16 slots in linear sRGB (`ABGR16161616F`, `srgb-linear`), the square at 4.0
+//!   (above SDR white); at 1.0 under `--check`, so the read-back compares exactly.
 //! - `--full`: repaint the whole frame each tick (default: a moving 100 px square).
 //! - `--check`: every 30 frames, render the display offscreen and compare the square's centre
-//!   with what was written. The colour then changes every frame, which flashes on screen.
+//!   with what was written, and a background pixel within 1 per channel (a frame read in the
+//!   wrong colour state is far off). The colour then changes every frame, which flashes on
+//!   screen.
 //! - `--seconds N`: quit after N seconds, printing the totals.
 //!
 //! Each second prints frames/s and the process's CPU (user + system, and system alone).
@@ -32,6 +36,9 @@ use rdw4::{
 const SLOTS: usize = 3;
 const SQUARE: i32 = 100;
 const DRM_FORMAT_XRGB8888: u32 = u32::from_le_bytes(*b"XR24");
+const DRM_FORMAT_ABGR16161616F: u32 = u32::from_le_bytes(*b"AB4H");
+/// The FP16 square's brightness, in SDR whites.
+const FP16_GAIN: f32 = 4.0;
 const DRM_FORMAT_MOD_LINEAR: u64 = 0;
 const BACKGROUND: u32 = 0xff20_2020;
 // Distinct square colours, one per frame in turn under --check, so a stale frame shows the
@@ -51,6 +58,7 @@ struct Options {
     dmabuf: bool,
     full: bool,
     check: bool,
+    fp16: bool,
     width: i32,
     height: i32,
     seconds: Option<u64>,
@@ -61,6 +69,7 @@ fn parse_options() -> Options {
         dmabuf: false,
         full: false,
         check: false,
+        fp16: false,
         width: 1920,
         height: 1080,
         seconds: None,
@@ -72,6 +81,7 @@ fn parse_options() -> Options {
             "--upload" => o.dmabuf = false,
             "--full" => o.full = true,
             "--check" => o.check = true,
+            "--fp16" => o.fp16 = true,
             "--size" => {
                 let v = args.next().expect("--size WxH");
                 let (w, h) = v.split_once('x').expect("--size WxH");
@@ -85,19 +95,80 @@ fn parse_options() -> Options {
     o
 }
 
-/// Three XRGB8888 slots in one sealed memfd: stride aligned to 256, offsets to pages.
+impl Options {
+    fn bpp(&self) -> usize {
+        self.format().bpp()
+    }
+
+    fn format(&self) -> PixelFormat {
+        if self.fp16 {
+            PixelFormat::Rgba16f
+        } else {
+            PixelFormat::Bgrx
+        }
+    }
+
+    fn fourcc(&self) -> u32 {
+        if self.fp16 {
+            DRM_FORMAT_ABGR16161616F
+        } else {
+            DRM_FORMAT_XRGB8888
+        }
+    }
+
+    /// An 0xAARRGGBB sRGB colour as a pixel of the slots' format, times `gain` in FP16.
+    fn pixel(&self, colour: u32, gain: f32) -> Vec<u8> {
+        if !self.fp16 {
+            return colour.to_le_bytes().to_vec();
+        }
+        let linear = |c: u32| {
+            let c = (c & 0xff) as f32 / 255.0;
+            let l = if c <= 0.04045 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            };
+            l * gain
+        };
+        [
+            linear(colour >> 16),
+            linear(colour >> 8),
+            linear(colour),
+            1.0,
+        ]
+        .into_iter()
+        .flat_map(|c| f16_bits(c).to_le_bytes())
+        .collect()
+    }
+}
+
+/// `v` as an IEEE half, for 0 and normal values (none here is subnormal or out of range).
+fn f16_bits(v: f32) -> u16 {
+    if v == 0.0 {
+        return 0;
+    }
+    let b = v.to_bits();
+    let sign = ((b >> 16) & 0x8000) as u16;
+    let exp = ((b >> 23) & 0xff) as i32 - 127 + 15;
+    let mantissa = (b >> 13) & 0x3ff;
+    sign | ((exp.clamp(1, 30) as u16) << 10) | mantissa as u16
+}
+
+/// Three slots of the chosen format in one sealed memfd: stride aligned to 256, offsets to
+/// pages.
 struct Slots {
     memfd: OwnedFd,
     map: *mut u8,
     len: usize,
+    bpp: usize,
     stride: usize,
     slot_size: usize,
 }
 
 impl Slots {
-    fn new(width: i32, height: i32) -> Self {
+    fn new(width: i32, height: i32, bpp: usize) -> Self {
         let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
-        let stride = (width as usize * 4).next_multiple_of(256);
+        let stride = (width as usize * bpp).next_multiple_of(256);
         let slot_size = (stride * height as usize).next_multiple_of(page);
         let len = slot_size * SLOTS;
         unsafe {
@@ -130,6 +201,7 @@ impl Slots {
                 memfd,
                 map: map as *mut u8,
                 len,
+                bpp,
                 stride,
                 slot_size,
             }
@@ -144,14 +216,14 @@ impl Slots {
         unsafe { std::slice::from_raw_parts_mut(self.map.add(i * self.slot_size), self.slot_size) }
     }
 
-    fn fill(&mut self, i: usize, r: &cairo::RectangleInt, colour: u32) {
-        let stride = self.stride;
+    fn fill(&mut self, i: usize, r: &cairo::RectangleInt, px: &[u8]) {
+        let (stride, bpp) = (self.stride, self.bpp);
         let slot = self.slot_mut(i);
-        let px = colour.to_le_bytes();
         for y in r.y()..r.y() + r.height() {
             let row = &mut slot[y as usize * stride..];
             for x in r.x()..r.x() + r.width() {
-                row[x as usize * 4..x as usize * 4 + 4].copy_from_slice(&px);
+                let at = x as usize * bpp;
+                row[at..at + bpp].copy_from_slice(px);
             }
         }
     }
@@ -215,7 +287,7 @@ fn slot_scanout(fd: &OwnedFd, slots: &Slots, o: &Options) -> RdwDmabufScanout {
         height: o.height as u32,
         offset: [0; 4],
         stride: [slots.stride as u32, 0, 0, 0],
-        fourcc: DRM_FORMAT_XRGB8888,
+        fourcc: o.fourcc(),
         modifier: DRM_FORMAT_MOD_LINEAR,
         fd: [fd.try_clone().unwrap().into_raw_fd(), -1, -1, -1],
         y0_top: false,
@@ -257,6 +329,11 @@ impl Source {
         }
     }
 
+    fn square_pixel(&self, frame: u64) -> Vec<u8> {
+        let gain = if self.o.check { 1.0 } else { FP16_GAIN };
+        self.o.pixel(self.colour(frame), gain)
+    }
+
     /// Writes the next frame into its slot; returns the slot and the damage against the frame
     /// the display shows.
     fn write(&mut self) -> (usize, Vec<cairo::RectangleInt>) {
@@ -264,16 +341,17 @@ impl Source {
         let i = frame as usize % SLOTS;
         let whole = cairo::RectangleInt::new(0, 0, self.o.width, self.o.height);
         if self.o.full {
-            self.slots.fill(i, &whole, self.colour(frame));
+            self.slots.fill(i, &whole, &self.square_pixel(frame));
             self.square_in[i] = None;
             return (i, vec![whole]);
         }
+        let background = self.o.pixel(BACKGROUND, 1.0);
         match self.square_in[i] {
-            Some(old) => self.slots.fill(i, &old, BACKGROUND),
-            None => self.slots.fill(i, &whole, BACKGROUND),
+            Some(old) => self.slots.fill(i, &old, &background),
+            None => self.slots.fill(i, &whole, &background),
         }
         let square = self.square(frame);
-        self.slots.fill(i, &square, self.colour(frame));
+        self.slots.fill(i, &square, &self.square_pixel(frame));
         self.square_in[i] = Some(square);
         let damage = match self.shown.replace(square) {
             Some(prev) => vec![prev, square],
@@ -333,7 +411,10 @@ fn main() -> glib::ExitCode {
 
 fn activate(app: &gtk::Application, o: Options) {
     let display: rdw4::Display = glib::Object::new();
-    display.set_display_pixel_format(PixelFormat::Bgrx);
+    display.set_display_pixel_format(o.format());
+    if o.fp16 {
+        display.set_display_color_state(&gdk::ColorState::srgb_linear());
+    }
     display.set_display_size(Some((o.width as usize, o.height as usize)));
     let window = gtk::ApplicationWindow::builder()
         .application(app)
@@ -344,7 +425,7 @@ fn activate(app: &gtk::Application, o: Options) {
         .build();
     window.present();
 
-    let slots = Slots::new(o.width, o.height);
+    let slots = Slots::new(o.width, o.height, o.bpp());
     let dmabufs = if o.dmabuf {
         slot_dmabufs(&slots)
     } else {
@@ -383,7 +464,7 @@ fn activate(app: &gtk::Application, o: Options) {
             let stride = s.slots.stride;
             let slot = s.slots.slot(i);
             for r in &damage {
-                let at = r.y() as usize * stride + r.x() as usize * 4;
+                let at = r.y() as usize * stride + r.x() as usize * s.slots.bpp;
                 display.update_area(
                     r.x(),
                     r.y(),
@@ -404,13 +485,26 @@ fn activate(app: &gtk::Application, o: Options) {
             };
             let expected = s.colour(s.frame);
             let (n, stale) = checks.get();
-            match read_back(display, &s.o, x, y) {
-                Some(got) if got == expected => checks.set((n + 1, stale)),
+            let mut ok = match read_back(display, &s.o, x, y) {
+                Some(got) if got == expected => true,
                 got => {
                     eprintln!("frame {}: expected {expected:#010x}, got {got:x?}", s.frame);
-                    checks.set((n + 1, stale + 1));
+                    false
+                }
+            };
+            if !s.o.full {
+                let near = |a: u32, b: u32| {
+                    (0..3).all(|i| ((a >> (8 * i)) as u8).abs_diff((b >> (8 * i)) as u8) <= 1)
+                };
+                match read_back(display, &s.o, 4, 4) {
+                    Some(got) if near(got, BACKGROUND) => {}
+                    got => {
+                        eprintln!("frame {}: background {got:x?}", s.frame);
+                        ok = false;
+                    }
                 }
             }
+            checks.set((n + 1, stale + u32::from(!ok)));
         }
         s.frame += 1;
 
