@@ -9,6 +9,7 @@ use gtk::glib::{
 };
 
 use crate::ffi;
+use gtk::gdk;
 
 /// cbindgen:ignore
 #[derive(Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Clone, Copy)]
@@ -211,6 +212,9 @@ impl ToValue for KeyEvent {
     }
 }
 
+/// GLES stores BGRA through EXT_texture_format_BGRA8888, in BGRA storage only.
+const BGRA_EXT: u32 = 0x80E1;
+
 /// Pixel formats supported by `Paintable`.
 #[derive(Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Clone, Copy, Default)]
 #[non_exhaustive]
@@ -251,6 +255,41 @@ impl PixelFormat {
 
     pub fn has_alpha(self) -> bool {
         !matches!(self, PixelFormat::Bgrx)
+    }
+
+    /// The format of a memory texture of these pixels.
+    pub(crate) fn memory_format(self) -> gdk::MemoryFormat {
+        match self {
+            PixelFormat::Bgra => gdk::MemoryFormat::B8g8r8a8Premultiplied,
+            PixelFormat::Rgba => gdk::MemoryFormat::R8g8b8a8Premultiplied,
+            PixelFormat::Bgrx => gdk::MemoryFormat::B8g8r8x8,
+            PixelFormat::Rgba16f => gdk::MemoryFormat::R16g16b16a16FloatPremultiplied,
+            other => {
+                log::warn!("Unrecognized pixel format {other:?}, falling back to B8G8R8A8");
+                gdk::MemoryFormat::B8g8r8a8Premultiplied
+            }
+        }
+    }
+
+    /// The internal format of a GL texture's storage for these pixels.
+    pub(crate) fn gl_internal_format(self, gles: bool) -> u32 {
+        match (gles, self) {
+            (_, PixelFormat::Rgba16f) => gl::RGBA16F,
+            (true, f) if f.as_opengl() == gl::BGRA => BGRA_EXT,
+            _ => gl::RGBA8,
+        }
+    }
+
+    /// What GTK is told that storage holds.
+    pub(crate) fn gl_memory_format(self, gles: bool) -> gdk::MemoryFormat {
+        use gdk::MemoryFormat as M;
+        match (self.gl_internal_format(gles), self.has_alpha()) {
+            (gl::RGBA16F, _) => M::R16g16b16a16Float,
+            (BGRA_EXT, true) => M::B8g8r8a8,
+            (BGRA_EXT, false) => M::B8g8r8x8,
+            (_, true) => M::R8g8b8a8,
+            (_, false) => M::R8g8b8x8,
+        }
     }
 }
 
@@ -314,5 +353,35 @@ impl ToValue for PixelFormat {
 
     fn value_type(&self) -> Type {
         <Self as StaticType>::static_type()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pixel_formats() {
+        assert_eq!(PixelFormat::Bgrx.bpp(), 4);
+        assert_eq!(PixelFormat::Rgba16f.bpp(), 8);
+        assert_eq!(PixelFormat::Rgba16f.gl_type(), gl::HALF_FLOAT);
+        assert_eq!(PixelFormat::Bgra.gl_type(), gl::UNSIGNED_BYTE);
+        for gles in [false, true] {
+            assert_eq!(PixelFormat::Rgba16f.gl_internal_format(gles), gl::RGBA16F);
+            assert_eq!(
+                PixelFormat::Rgba16f.gl_memory_format(gles),
+                gdk::MemoryFormat::R16g16b16a16Float
+            );
+            assert_eq!(PixelFormat::Rgba.gl_internal_format(gles), gl::RGBA8);
+        }
+        assert_eq!(PixelFormat::Bgrx.gl_internal_format(true), BGRA_EXT);
+        assert_eq!(
+            PixelFormat::Bgrx.gl_memory_format(true),
+            gdk::MemoryFormat::B8g8r8x8
+        );
+        assert_eq!(
+            PixelFormat::Bgra.gl_memory_format(false),
+            gdk::MemoryFormat::R8g8b8a8
+        );
     }
 }

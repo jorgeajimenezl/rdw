@@ -73,9 +73,6 @@ struct Import {
 #[cfg(unix)]
 const KEPT_IMPORTS: usize = 4;
 
-/// GLES stores BGRA through EXT_texture_format_BGRA8888, in BGRA storage only.
-const BGRA_EXT: u32 = 0x80E1;
-
 #[derive(Debug, Default)]
 pub struct Paintable {
     buffer: RefCell<Vec<u8>>,
@@ -202,31 +199,17 @@ impl Paintable {
         cairo::Region::create_rectangle(&clamp_rect(&grown, w, h).unwrap_or(r))
     }
 
-    fn memory_format(format: PixelFormat) -> gdk::MemoryFormat {
-        match format {
-            PixelFormat::Bgra => gdk::MemoryFormat::B8g8r8a8Premultiplied,
-            PixelFormat::Rgba => gdk::MemoryFormat::R8g8b8a8Premultiplied,
-            PixelFormat::Bgrx => gdk::MemoryFormat::B8g8r8x8,
-            PixelFormat::Rgba16f => gdk::MemoryFormat::R16g16b16a16FloatPremultiplied,
-            other => {
-                log::warn!("Unrecognized pixel format {other:?}, falling back to B8G8R8A8");
-                gdk::MemoryFormat::B8g8r8a8Premultiplied
-            }
-        }
-    }
-
     pub(crate) fn set_pixel_format(&self, format: PixelFormat) -> Result<(), glib::error::Error> {
         if self.pixel_format() == format {
             return Ok(());
         }
-        self.pixel_format.set(format);
+        let old = self.pixel_format.replace(format);
         // The previous texture is of another format.
         self.texture.replace(None);
-        let (w, h) = self.size();
-        let mut buffer = self.buffer.borrow_mut();
-        buffer.clear();
-        buffer.resize(w as usize * h as usize * format.bpp(), 0);
-        drop(buffer);
+        if old.bpp() != format.bpp() {
+            self.buffer.borrow_mut().clear();
+            self.resize_buffer();
+        }
 
         #[cfg(windows)]
         {
@@ -257,6 +240,13 @@ impl Paintable {
         self.gl_storage.set(None);
     }
 
+    /// Sizes the frame buffer for the size and format, keeping what fits.
+    fn resize_buffer(&self) {
+        let (w, h) = self.size();
+        let len = w as usize * h as usize * self.pixel_format.get().bpp();
+        self.buffer.borrow_mut().resize(len, 0);
+    }
+
     pub(crate) fn set_size(&self, w: usize, h: usize) -> Result<(), glib::error::Error> {
         if self.size() == (w as _, h as _) {
             return Ok(());
@@ -264,10 +254,7 @@ impl Paintable {
         let (w, h) = (w as i32, h as i32);
         self.width.set(w);
         self.height.set(h);
-        self.buffer.borrow_mut().resize(
-            (w as usize) * (h as usize) * self.pixel_format.get().bpp(),
-            0,
-        );
+        self.resize_buffer();
         self.texture.replace(None);
 
         #[cfg(windows)]
@@ -348,7 +335,7 @@ impl Paintable {
             let region = self.damage_region(cairo::RectangleInt::new(x, y, w, h));
             let texture = gdk::MemoryTextureBuilder::new()
                 .set_bytes(Some(&bytes))
-                .set_format(Self::memory_format(self.pixel_format.get()))
+                .set_format(self.pixel_format.get().memory_format())
                 .set_width(max_w)
                 .set_height(max_h)
                 .set_stride(buf_stride)
@@ -552,22 +539,13 @@ impl Paintable {
     ) -> Result<(), glib::error::Error> {
         let (w, h) = size;
         let ctxt = self.gl_context()?;
+        let gles = ctxt.api() == gdk::GLAPI::GLES;
         ctxt.make_current();
 
         unsafe {
             assert_eq!(gl::GetError(), gl::NO_ERROR);
             gl::BindTexture(gl::TEXTURE_2D, self.texture_id()?);
-            gl::TexImage2D(
-                gl::TEXTURE_2D,
-                0,
-                gl::RGBA as _,
-                w as _,
-                h as _,
-                0,
-                format.as_opengl(),
-                gl::UNSIGNED_BYTE,
-                std::ptr::null(),
-            );
+            Self::alloc_storage(gles, (w, h, format), std::ptr::null());
             if gl::GetError() != gl::NO_ERROR {
                 gl::TexImage2D(
                     gl::TEXTURE_2D,
@@ -898,7 +876,6 @@ impl Paintable {
     }
 
     /// (Re)allocates the bound texture's storage, filled from `data` (or left undefined).
-    #[cfg(unix)]
     unsafe fn alloc_storage(
         gles: bool,
         (w, h, format): (i32, i32, PixelFormat),
@@ -907,7 +884,7 @@ impl Paintable {
         gl::TexImage2D(
             gl::TEXTURE_2D,
             0,
-            gl_internal_format(gles, format) as _,
+            format.gl_internal_format(gles) as _,
             w,
             h,
             0,
@@ -931,7 +908,10 @@ impl Paintable {
         region: Option<&cairo::Region>,
     ) -> Result<(), glib::error::Error> {
         let ctxt = self.gl_context()?;
-        let gles = ctxt.api() == gdk::GLAPI::GLES;
+        let memory_format = self
+            .pixel_format
+            .get()
+            .gl_memory_format(ctxt.api() == gdk::GLAPI::GLES);
         ctxt.make_current();
         #[cfg(unix)]
         self.delete_released_syncs();
@@ -944,7 +924,7 @@ impl Paintable {
                 .set_id(self.texture_id()?)
                 .set_width(w)
                 .set_height(h)
-                .set_format(gl_memory_format(gles, self.pixel_format.get()))
+                .set_format(memory_format)
                 .set_color_state(&self.color_state())
                 .set_update_region(region)
                 .set_update_texture(self.texture.take().as_ref());
@@ -972,27 +952,6 @@ impl Paintable {
         }
 
         Ok(())
-    }
-}
-
-/// The internal format of the texture's storage for `format`.
-fn gl_internal_format(gles: bool, format: PixelFormat) -> u32 {
-    match (gles, format) {
-        (_, PixelFormat::Rgba16f) => gl::RGBA16F,
-        (true, f) if f.as_opengl() == gl::BGRA => BGRA_EXT,
-        _ => gl::RGBA8,
-    }
-}
-
-/// What GTK is told the texture's storage holds.
-fn gl_memory_format(gles: bool, format: PixelFormat) -> gdk::MemoryFormat {
-    use gdk::MemoryFormat as M;
-    match (gl_internal_format(gles, format), format.has_alpha()) {
-        (gl::RGBA16F, _) => M::R16g16b16a16Float,
-        (BGRA_EXT, true) => M::B8g8r8a8,
-        (BGRA_EXT, false) => M::B8g8r8x8,
-        (_, true) => M::R8g8b8a8,
-        (_, false) => M::R8g8b8x8,
     }
 }
 
@@ -1045,31 +1004,6 @@ mod tests {
         assert_eq!(clamp_rect(&rect(0, 0, 0, 10), 100, 100), None);
         assert_eq!(clamp_rect(&rect(0, 0, -10, 10), 100, 100), None);
         assert_eq!(clamp_rect(&rect(i32::MAX, 0, i32::MAX, 1), 100, 100), None);
-    }
-
-    #[test]
-    fn formats() {
-        assert_eq!(PixelFormat::Bgrx.bpp(), 4);
-        assert_eq!(PixelFormat::Rgba16f.bpp(), 8);
-        assert_eq!(PixelFormat::Rgba16f.gl_type(), gl::HALF_FLOAT);
-        assert_eq!(PixelFormat::Bgra.gl_type(), gl::UNSIGNED_BYTE);
-        for gles in [false, true] {
-            assert_eq!(gl_internal_format(gles, PixelFormat::Rgba16f), gl::RGBA16F);
-            assert_eq!(
-                gl_memory_format(gles, PixelFormat::Rgba16f),
-                gdk::MemoryFormat::R16g16b16a16Float
-            );
-            assert_eq!(gl_internal_format(gles, PixelFormat::Rgba), gl::RGBA8);
-        }
-        assert_eq!(gl_internal_format(true, PixelFormat::Bgrx), BGRA_EXT);
-        assert_eq!(
-            gl_memory_format(true, PixelFormat::Bgrx),
-            gdk::MemoryFormat::B8g8r8x8
-        );
-        assert_eq!(
-            gl_memory_format(false, PixelFormat::Bgra),
-            gdk::MemoryFormat::R8g8b8a8
-        );
     }
 
     #[test]

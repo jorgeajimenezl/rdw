@@ -96,10 +96,6 @@ fn parse_options() -> Options {
 }
 
 impl Options {
-    fn bpp(&self) -> usize {
-        self.format().bpp()
-    }
-
     fn format(&self) -> PixelFormat {
         if self.fp16 {
             PixelFormat::Rgba16f
@@ -160,7 +156,6 @@ struct Slots {
     memfd: OwnedFd,
     map: *mut u8,
     len: usize,
-    bpp: usize,
     stride: usize,
     slot_size: usize,
 }
@@ -201,7 +196,6 @@ impl Slots {
                 memfd,
                 map: map as *mut u8,
                 len,
-                bpp,
                 stride,
                 slot_size,
             }
@@ -217,7 +211,7 @@ impl Slots {
     }
 
     fn fill(&mut self, i: usize, r: &cairo::RectangleInt, px: &[u8]) {
-        let (stride, bpp) = (self.stride, self.bpp);
+        let (stride, bpp) = (self.stride, px.len());
         let slot = self.slot_mut(i);
         for y in r.y()..r.y() + r.height() {
             let row = &mut slot[y as usize * stride..];
@@ -301,6 +295,9 @@ struct Source {
     slots: Slots,
     dmabufs: Vec<OwnedFd>,
     frame: u64,
+    background: Vec<u8>,
+    /// `COLOURS` as pixels, at the square's brightness.
+    square_pixels: Vec<Vec<u8>>,
     /// The square in each slot, to erase before drawing the next one there.
     square_in: [Option<cairo::RectangleInt>; SLOTS],
     /// The square the display shows.
@@ -321,17 +318,16 @@ impl Source {
 
     /// The square's colour (the whole frame's with `--full`): steady, or with `--check` a new
     /// one each frame, so a stale frame shows the wrong one. That flashes on screen.
-    fn colour(&self, frame: u64) -> u32 {
+    fn colour_index(&self, frame: u64) -> usize {
         if self.o.check {
-            COLOURS[frame as usize % COLOURS.len()]
+            frame as usize % COLOURS.len()
         } else {
-            COLOURS[0]
+            0
         }
     }
 
-    fn square_pixel(&self, frame: u64) -> Vec<u8> {
-        let gain = if self.o.check { 1.0 } else { FP16_GAIN };
-        self.o.pixel(self.colour(frame), gain)
+    fn colour(&self, frame: u64) -> u32 {
+        COLOURS[self.colour_index(frame)]
     }
 
     /// Writes the next frame into its slot; returns the slot and the damage against the frame
@@ -341,17 +337,16 @@ impl Source {
         let i = frame as usize % SLOTS;
         let whole = cairo::RectangleInt::new(0, 0, self.o.width, self.o.height);
         if self.o.full {
-            self.slots.fill(i, &whole, &self.square_pixel(frame));
+            let px = &self.square_pixels[self.colour_index(frame)];
+            self.slots.fill(i, &whole, px);
             self.square_in[i] = None;
             return (i, vec![whole]);
         }
-        let background = self.o.pixel(BACKGROUND, 1.0);
-        match self.square_in[i] {
-            Some(old) => self.slots.fill(i, &old, &background),
-            None => self.slots.fill(i, &whole, &background),
-        }
+        let old = self.square_in[i].unwrap_or(whole);
+        self.slots.fill(i, &old, &self.background);
         let square = self.square(frame);
-        self.slots.fill(i, &square, &self.square_pixel(frame));
+        let px = &self.square_pixels[self.colour_index(frame)];
+        self.slots.fill(i, &square, px);
         self.square_in[i] = Some(square);
         let damage = match self.shown.replace(square) {
             Some(prev) => vec![prev, square],
@@ -425,7 +420,8 @@ fn activate(app: &gtk::Application, o: Options) {
         .build();
     window.present();
 
-    let slots = Slots::new(o.width, o.height, o.bpp());
+    let slots = Slots::new(o.width, o.height, o.format().bpp());
+    let gain = if o.check { 1.0 } else { FP16_GAIN };
     let dmabufs = if o.dmabuf {
         slot_dmabufs(&slots)
     } else {
@@ -436,6 +432,8 @@ fn activate(app: &gtk::Application, o: Options) {
         slots,
         dmabufs,
         frame: 0,
+        background: o.pixel(BACKGROUND, 1.0),
+        square_pixels: COLOURS.iter().map(|&c| o.pixel(c, gain)).collect(),
         square_in: [None; SLOTS],
         shown: None,
     }));
@@ -464,7 +462,7 @@ fn activate(app: &gtk::Application, o: Options) {
             let stride = s.slots.stride;
             let slot = s.slots.slot(i);
             for r in &damage {
-                let at = r.y() as usize * stride + r.x() as usize * s.slots.bpp;
+                let at = r.y() as usize * stride + r.x() as usize * s.o.format().bpp();
                 display.update_area(
                     r.x(),
                     r.y(),
@@ -485,25 +483,21 @@ fn activate(app: &gtk::Application, o: Options) {
             };
             let expected = s.colour(s.frame);
             let (n, stale) = checks.get();
-            let mut ok = match read_back(display, &s.o, x, y) {
-                Some(got) if got == expected => true,
+            let check = |x, y, want: u32, slack: u8| match read_back(display, &s.o, x, y) {
+                Some(got)
+                    if (0..3).all(|i| {
+                        ((got >> (8 * i)) as u8).abs_diff((want >> (8 * i)) as u8) <= slack
+                    }) =>
+                {
+                    true
+                }
                 got => {
-                    eprintln!("frame {}: expected {expected:#010x}, got {got:x?}", s.frame);
+                    eprintln!("frame {}: expected {want:#010x}, got {got:x?}", s.frame);
                     false
                 }
             };
-            if !s.o.full {
-                let near = |a: u32, b: u32| {
-                    (0..3).all(|i| ((a >> (8 * i)) as u8).abs_diff((b >> (8 * i)) as u8) <= 1)
-                };
-                match read_back(display, &s.o, 4, 4) {
-                    Some(got) if near(got, BACKGROUND) => {}
-                    got => {
-                        eprintln!("frame {}: background {got:x?}", s.frame);
-                        ok = false;
-                    }
-                }
-            }
+            // `&`, not `&&`: both report.
+            let ok = check(x, y, expected, 0) & (s.o.full || check(4, 4, BACKGROUND, 1));
             checks.set((n + 1, stale + u32::from(!ok)));
         }
         s.frame += 1;

@@ -19,6 +19,8 @@ impl Paintable {
         glib::Object::new()
     }
 
+    /// The format of the frames' pixels. A DMABUF scanout's storage follows it too, so an FP16
+    /// buffer needs `Rgba16f`. After a change of bytes per pixel, send a whole frame.
     pub fn set_pixel_format(&self, format: PixelFormat) -> Result<(), glib::error::Error> {
         self.imp().set_pixel_format(format)
     }
